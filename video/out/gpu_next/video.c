@@ -9,6 +9,7 @@
 #include "libplacebo/filters.h"            // for pl_filter_nearest
 #include "libplacebo/gpu.h"                // for pl_tex_params, pl_tex_t
 #include "libplacebo/renderer.h"           // for pl_frame_mix, pl_frame
+#include "options/m_config.h"              // for m_config_cache
 #include "sub/draw_bmp.h"                  // for mp_draw_sub_formats
 #include "sub/osd.h"                       // for sub_bitmap, sub_bitmaps
 #include "ta/ta_talloc.h"                  // for talloc_free, talloc_zero
@@ -16,6 +17,7 @@
 #include "video/img_format.h"              // for mp_imgfmt
 #include "video/mp_image.h"                // for mp_image, mp_image_params
 #include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
+#include "video/out/gpu/video.h"           // for gl_video_opts, gl_video_conf
 #include "video/out/vo.h"                  // for vo_frame
 
 // Forward declarations
@@ -60,6 +62,9 @@ struct pl_video {
     ra_queue queue;        // The frame queue for handling video frames and interpolation.
     uint64_t last_frame_id;// To avoid pushing duplicate frames into the queue.
     double last_pts;       // Last presentation timestamp we rendered at, for redraws.
+
+    // Options cache for target colorspace settings
+    struct m_config_cache *opts_cache;
 
     // Render State
     struct mp_image_params current_params; // Current video parameters (resolution, colorspace, etc.).
@@ -164,6 +169,9 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, st
     p->log = log;
     p->ra = ra;
     p->queue = ra_next_queue_create(ra);
+
+    // Get video options for target colorspace settings
+    p->opts_cache = m_config_cache_alloc(p, global, &gl_video_conf);
 
     // Pre-find the texture formats we'll need for OSD bitmaps for efficiency.
     p->osd_fmt[SUBBITMAP_LIBASS] = ra_next_find_fmt(p->ra, PL_FMT_UNORM, 1, 8, 8, 0);
@@ -320,12 +328,36 @@ static void update_overlays(struct pl_video *p, struct mp_osd_res res,
  */
 void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex)
 {
+    // Get current options for target colorspace
+    m_config_cache_update(p->opts_cache);
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+
+    // Determine target colorspace from options
+    struct pl_color_space target_color = pl_color_space_srgb;
+    if (opts->target_trc || opts->target_prim) {
+        target_color = (struct pl_color_space){
+            .primaries = opts->target_prim ? opts->target_prim : PL_COLOR_PRIM_BT_709,
+            .transfer = opts->target_trc ? opts->target_trc : PL_COLOR_TRC_SRGB,
+        };
+        // For HDR outputs, set peak luminance to allow extended range
+        if (opts->target_peak > 0) {
+            target_color.hdr.max_luma = opts->target_peak;
+        }
+    }
+
+    static int debug_once = 0;
+    if (!debug_once) {
+        debug_once = 1;
+        MP_INFO(p, "target colorspace: trc=%d prim=%d peak=%.0f\n",
+                target_color.transfer, target_color.primaries, target_color.hdr.max_luma);
+    }
+
     // Describe the target surface for libplacebo.
     struct pl_frame target_frame = {
         .num_planes = 1,
         .planes[0] = { .texture = target_tex, .components = 4, .component_mapping = {0,1,2,3} },
         .crop = { .x0 = p->current_dst.x0, .y0 = p->current_dst.y0, .x1 = p->current_dst.x1, .y1 = p->current_dst.y1 },
-        .color = pl_color_space_srgb,
+        .color = target_color,
         .repr = pl_color_repr_rgb,
     };
 

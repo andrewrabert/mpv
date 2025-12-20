@@ -1815,6 +1815,9 @@ if get_option('libmpv')
 
     headers = ['include/mpv/client.h', 'include/mpv/render.h',
                'include/mpv/render_gl.h', 'include/mpv/stream_cb.h']
+    if features['vulkan']
+        headers += 'include/mpv/render_vk.h'
+    endif
     install_headers(headers, subdir: 'mpv')
 
     # Allow projects to build with libmpv by cloning into ./subprojects/mpv

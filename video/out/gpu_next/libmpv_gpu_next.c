@@ -31,11 +31,14 @@ struct priv {
 };
 
 /*
-* List of available API context implementations (e.g., GL, Vulkan - currently only OpenGL)
+* List of available API context implementations (e.g., GL, Vulkan)
 */
 static const struct libmpv_gpu_next_context_fns *context_backends[] = {
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     &libmpv_gpu_next_context_gl,
+#endif
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+    &libmpv_gpu_next_context_vk,
 #endif
     NULL
 };

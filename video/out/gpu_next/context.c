@@ -28,6 +28,13 @@
 #include "video/out/gpu_next/ra.h"               // for ra_pl_create, ra_pl_...
 #endif
 
+#ifdef PL_HAVE_VULKAN
+#include "mpv/render_vk.h"                       // for mpv_vulkan_init_params
+#include <libplacebo/vulkan.h>                   // for pl_vulkan_import
+#include "video/out/gpu_next/libmpv_gpu_next.h"  // for libmpv_gpu_next_context
+#include "video/out/gpu_next/ra.h"               // for ra_pl_create, ra_pl_...
+#endif
+
 #include <stddef.h>                              // for NULL
 #include "config.h"                              // for HAVE_GL, HAVE_D3D11
 #include "context.h"                             // for gpu_ctx
@@ -428,5 +435,201 @@ const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_gl = {
     .wrap_fbo = libmpv_gpu_next_wrap_fbo_gl,
     .done_frame = libmpv_gpu_next_done_frame_gl,
     .destroy = libmpv_gpu_next_destroy_gl,
+};
+#endif
+
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+// Store Libplacebo Vulkan context information.
+struct priv_vk {
+    pl_log pl_log;
+    pl_vulkan vulkan;
+    pl_gpu gpu;
+    struct ra_next *ra;
+};
+
+/**
+ * @brief Callback to log messages from libplacebo (Vulkan).
+ */
+static void pl_log_cb_vk(void *log_priv, enum pl_log_level level, const char *msg)
+{
+    struct mp_log *log = log_priv;
+    mp_msg(log, MSGL_WARN, "[gpu-next:pl] %s\n", msg);
+}
+
+/**
+ * @brief Initializes the Vulkan context for the GPU next renderer.
+ * @param ctx The libmpv_gpu_next_context to initialize.
+ * @param params The render parameters.
+ * @return 0 on success, negative error code on failure.
+ */
+static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_render_param *params)
+{
+    ctx->priv = talloc_zero(NULL, struct priv_vk);
+    struct priv_vk *p = ctx->priv;
+
+    mpv_vulkan_init_params *vk_params =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_INIT_PARAMS, NULL);
+    if (!vk_params)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    if (!vk_params->instance || !vk_params->physical_device ||
+        !vk_params->device || !vk_params->graphics_queue) {
+        MP_ERR(ctx, "Missing required Vulkan handles\n");
+        return MPV_ERROR_INVALID_PARAMETER;
+    }
+
+    // Setup libplacebo logging
+    struct pl_log_params log_params = {
+        .log_level = PL_LOG_DEBUG
+    };
+
+    // Enable verbose logging if trace is enabled
+    if (mp_msg_test(ctx->log, MSGL_TRACE)) {
+        log_params.log_cb = pl_log_cb_vk;
+        log_params.log_priv = ctx->log;
+    }
+
+    p->pl_log = pl_log_create(PL_API_VER, &log_params);
+    if (!p->pl_log) {
+        MP_ERR(ctx, "Failed to create libplacebo log\n");
+        return MPV_ERROR_GENERIC;
+    }
+
+    // Import user's Vulkan device into libplacebo
+    PFN_vkGetInstanceProcAddr get_proc = vk_params->get_instance_proc_addr;
+    if (!get_proc)
+        get_proc = vkGetInstanceProcAddr;
+
+    struct pl_vulkan_import_params import_params = {
+        .instance = vk_params->instance,
+        .phys_device = vk_params->physical_device,
+        .device = vk_params->device,
+        .get_proc_addr = get_proc,
+        .queue_graphics = {
+            .index = vk_params->graphics_queue_family,
+            .count = 1,
+        },
+        .features = vk_params->features,
+        .extensions = vk_params->extensions,
+        .num_extensions = vk_params->num_extensions,
+    };
+
+    p->vulkan = pl_vulkan_import(p->pl_log, &import_params);
+    if (!p->vulkan) {
+        MP_ERR(ctx, "Failed to import Vulkan device\n");
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_UNSUPPORTED;
+    }
+
+    p->gpu = p->vulkan->gpu;
+
+    // Create the RA abstraction
+    p->ra = ra_pl_create(p->gpu, ctx->log, p->pl_log);
+    if (!p->ra) {
+        MP_ERR(ctx, "Failed to create RA from pl_gpu\n");
+        pl_vulkan_destroy(&p->vulkan);
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_VO_INIT_FAILED;
+    }
+
+    ctx->ra = p->ra;
+    ctx->gpu = p->gpu;
+    return 0;
+}
+
+/**
+ * @brief Wraps a Vulkan image as a libplacebo texture.
+ * @param ctx The libmpv_gpu_next_context.
+ * @param params The render parameters.
+ * @param out_tex Pointer to the output texture.
+ * @return 0 on success, negative error code on failure.
+ */
+static int libmpv_gpu_next_wrap_fbo_vk(struct libmpv_gpu_next_context *ctx,
+                    mpv_render_param *params, pl_tex *out_tex)
+{
+    struct priv_vk *p = ctx->priv;
+    *out_tex = NULL;
+
+    mpv_vulkan_fbo *fbo =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_FBO, NULL);
+    if (!fbo)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    if (!fbo->image || !fbo->width || !fbo->height) {
+        MP_ERR(ctx, "Invalid Vulkan FBO parameters\n");
+        return MPV_ERROR_INVALID_PARAMETER;
+    }
+
+    // Wrap the VkImage as pl_tex using pl_vulkan_wrap
+    struct pl_vulkan_wrap_params wrap_params = {
+        .image = fbo->image,
+        .width = fbo->width,
+        .height = fbo->height,
+        .format = fbo->format,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    };
+
+    pl_tex tex = pl_vulkan_wrap(p->gpu, &wrap_params);
+    if (!tex) {
+        MP_ERR(ctx, "Failed to wrap VkImage as pl_tex\n");
+        return MPV_ERROR_GENERIC;
+    }
+
+    // Release the texture to libplacebo - it starts out "held" by user
+    // We need to tell libplacebo it can now use the texture
+    struct pl_vulkan_release_params release_params = {
+        .tex = tex,
+        .layout = fbo->current_layout,
+        .qf = VK_QUEUE_FAMILY_IGNORED,
+    };
+    pl_vulkan_release_ex(p->gpu, &release_params);
+
+    *out_tex = tex;
+    return 0;
+}
+
+/**
+ * @brief Callback to mark the end of a frame rendering (Vulkan).
+ * @param ctx The libmpv_gpu_next_context.
+ */
+static void libmpv_gpu_next_done_frame_vk(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv_vk *p = ctx->priv;
+
+    // Ensure GPU work is complete
+    pl_gpu_finish(p->gpu);
+}
+
+/**
+ * @brief Destroys the Vulkan context for the GPU next renderer.
+ * @param ctx The libmpv_gpu_next_context to destroy.
+ */
+static void libmpv_gpu_next_destroy_vk(struct libmpv_gpu_next_context *ctx)
+{
+    struct priv_vk *p = ctx->priv;
+    if (!p)
+        return;
+
+    if (p->ra) {
+        ra_pl_destroy(&p->ra);
+    }
+
+    if (p->vulkan) {
+        pl_vulkan_destroy(&p->vulkan);
+    }
+
+    pl_log_destroy(&p->pl_log);
+}
+
+/**
+ * @brief Context functions for the Vulkan GPU next renderer.
+ */
+const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_vk = {
+    .api_name = MPV_RENDER_API_TYPE_VULKAN,
+    .init = libmpv_gpu_next_init_vk,
+    .wrap_fbo = libmpv_gpu_next_wrap_fbo_vk,
+    .done_frame = libmpv_gpu_next_done_frame_vk,
+    .destroy = libmpv_gpu_next_destroy_vk,
 };
 #endif

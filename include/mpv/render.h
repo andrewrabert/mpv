@@ -432,6 +432,26 @@ typedef enum mpv_render_param_type {
      *   "gpu-next"
      */
     MPV_RENDER_PARAM_BACKEND = 21,
+    /**
+     * Required parameters for initializing the Vulkan renderer. Valid for
+     * mpv_render_context_create().
+     * Type: mpv_vulkan_init_params*
+     * See render_vk.h header.
+     */
+    MPV_RENDER_PARAM_VULKAN_INIT_PARAMS = 22,
+    /**
+     * Describes a Vulkan render target. Valid for mpv_render_context_render().
+     * Type: mpv_vulkan_fbo*
+     * See render_vk.h header.
+     */
+    MPV_RENDER_PARAM_VULKAN_FBO = 23,
+    /**
+     * Optional synchronization primitives for Vulkan. Valid for
+     * mpv_render_context_render().
+     * Type: mpv_vulkan_sync*
+     * See render_vk.h header.
+     */
+    MPV_RENDER_PARAM_VULKAN_SYNC = 24,
 } mpv_render_param_type;
 
 /**
@@ -476,6 +496,8 @@ typedef struct mpv_render_param {
  */
 // See render_gl.h
 #define MPV_RENDER_API_TYPE_OPENGL "opengl"
+// See render_vk.h
+#define MPV_RENDER_API_TYPE_VULKAN "vulkan"
 // See section "Software renderer"
 #define MPV_RENDER_API_TYPE_SW "sw"
 

@@ -74,7 +74,14 @@ struct libmpv_gpu_next_context_fns {
 
 /**
  * A forward declaration for the concrete OpenGL API context implementation,
- * which is defined in `libmpv_gpu_next_gl.c`. The Host needs this to add it
+ * which is defined in `context.c`. The Host needs this to add it
  * to its list of available backends.
  */
 extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_gl;
+
+/**
+ * A forward declaration for the concrete Vulkan API context implementation,
+ * which is defined in `context.c`. The Host needs this to add it
+ * to its list of available backends.
+ */
+extern const struct libmpv_gpu_next_context_fns libmpv_gpu_next_context_vk;
