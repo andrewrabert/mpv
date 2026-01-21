@@ -24,6 +24,11 @@ struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, st
 void pl_video_uninit(struct pl_video **p_ptr);
 
 /**
+ * Sets whether the output should be flipped vertically (for OpenGL FBO orientation).
+ */
+void pl_video_set_flipped(struct pl_video *p, bool flipped);
+
+/**
  * Synchronously renders a video frame to a display target using libplacebo.
  */
 void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex);

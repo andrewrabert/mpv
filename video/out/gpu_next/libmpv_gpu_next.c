@@ -132,6 +132,10 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     struct priv *p = ctx->priv;
     if (!p->video_engine) return MPV_ERROR_UNINITIALIZED;
 
+    // Handle FLIP_Y for OpenGL FBO orientation (per-frame).
+    int *flip_y = get_mpv_render_param(params, MPV_RENDER_PARAM_FLIP_Y, NULL);
+    pl_video_set_flipped(p->video_engine, flip_y && *flip_y);
+
     // Wrap the framebuffer object (FBO) for rendering.
     pl_tex target_tex = NULL;
     int err = p->context->fns->wrap_fbo(p->context, params, &target_tex);
