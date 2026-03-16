@@ -50,8 +50,8 @@ void pl_video_reconfig(struct pl_video *p, const struct mp_image_params *params)
 /**
  * Informs the engine that the output viewport has been resized.
  */
-// void pl_video_resize(struct pl_video *p, const struct mp_rect *dst);
-void pl_video_resize(struct pl_video *p, const struct mp_rect *dst, const struct mp_osd_res *osd);
+void pl_video_resize(struct pl_video *p, const struct mp_rect *src,
+                     const struct mp_rect *dst, const struct mp_osd_res *osd);
 /**
  * Provides the engine with the current On-Screen Display state.
  */

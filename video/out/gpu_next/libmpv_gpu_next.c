@@ -178,7 +178,7 @@ static void resize(struct render_backend *ctx, struct mp_rect *src,
 {
     struct priv *p = ctx->priv;
     if (p->video_engine)
-        pl_video_resize(p->video_engine, dst, osd);
+        pl_video_resize(p->video_engine, src, dst, osd);
 }
 
 /*
