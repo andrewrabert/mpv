@@ -71,6 +71,7 @@ struct pl_video {
 
     // Render State
     struct mp_image_params current_params; // Current video parameters (resolution, colorspace, etc.).
+    struct mp_rect current_src;            // The current source crop rectangle (from aspect ratio calculation).
     struct mp_rect current_dst;            // The current destination rectangle on the target surface.
     struct osd_state *current_osd_state; // Pointer to the core's logical OSD state.
 
@@ -123,6 +124,9 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         talloc_free(mpi); // Clean up the mp_image reference on failure
         return false;
     }
+
+    // Set rotation so libplacebo can undo mpv's pre-rotated crop rects.
+    frame->rotation = mpi->params.rotate / 90;
 
     // Store a pointer back to the original mp_image. This is used to get a unique
     // signature for the frame and to access metadata (like colorspace) later.
@@ -421,6 +425,36 @@ static const struct pl_filter_config *map_scaler(struct pl_video *p,
 }
 
 /**
+ * @brief Applies an mpv crop rect to a libplacebo frame.
+ *
+ * mpv provides crop rects in rotated/flipped coordinates, but libplacebo
+ * expects unrotated coordinates. This function undoes the rotation and
+ * handles flipped rects.
+ */
+static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
+                       int width, int height)
+{
+    frame->crop = (struct pl_rect2df) {
+        .x0 = crop.x0,
+        .y0 = crop.y0,
+        .x1 = crop.x1,
+        .y1 = crop.y1,
+    };
+
+    // mpv gives us rotated/flipped rects, libplacebo expects unrotated
+    pl_rect2df_rotate(&frame->crop, -frame->rotation);
+    if (frame->crop.x1 < frame->crop.x0) {
+        frame->crop.x0 = width - frame->crop.x0;
+        frame->crop.x1 = width - frame->crop.x1;
+    }
+
+    if (frame->crop.y1 < frame->crop.y0) {
+        frame->crop.y0 = height - frame->crop.y0;
+        frame->crop.y1 = height - frame->crop.y1;
+    }
+}
+
+/**
  * @brief Main rendering function for a single video frame.
  * @param p The pl_video engine context.
  * @param frame The mpv frame to render, containing the current image.
@@ -512,6 +546,14 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
     }
     struct pl_frame_mix mix = queue_mix;
     mix.signatures = signatures;
+
+    // Apply source crop to all frames in the mix. This tells libplacebo
+    // which region of the decoded frame to render (e.g. MKV PixelCrop).
+    for (int i = 0; i < mix.num_frames; i++) {
+        struct pl_frame *image = (struct pl_frame *) mix.frames[i];
+        struct mp_image *mpi = image->user_data;
+        apply_crop(image, p->current_src, mpi->params.w, mpi->params.h);
+    }
 
     // Generate and attach OSD overlays to the target frame. If mix.num_frames is 0,
     // representative_img will be NULL, and update_overlays will correctly render
@@ -675,10 +717,14 @@ void pl_video_reconfig(struct pl_video *p, const struct mp_image_params *params)
 /**
  * @brief Informs the engine that the output viewport has been resized.
  * @param p The pl_video engine context.
+ * @param src The new source crop rectangle.
  * @param dst The new destination rectangle.
  * @param osd The new OSD resolution information.
  */
-void pl_video_resize(struct pl_video *p, const struct mp_rect *dst, const struct mp_osd_res *osd) {
+void pl_video_resize(struct pl_video *p, const struct mp_rect *src,
+                     const struct mp_rect *dst, const struct mp_osd_res *osd) {
+    if (src)
+        p->current_src = *src;
     if (dst)
         p->current_dst = *dst;
     if (osd)
