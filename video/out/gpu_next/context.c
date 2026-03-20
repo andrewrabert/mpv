@@ -539,13 +539,19 @@ static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_rend
             };
             mpv_display_profile *dp =
                 get_mpv_render_param(params, MPV_RENDER_PARAM_DISPLAY_PROFILE, NULL);
-            if (dp && dp->max_luma > 0) {
-                hdr_hint.hdr.min_luma = dp->min_luma;
-                hdr_hint.hdr.max_luma = dp->max_luma;
-                hdr_hint.hdr.max_cll = dp->max_cll;
-                hdr_hint.hdr.max_fall = dp->max_fall;
-                MP_INFO(ctx, "Display profile: peak=%.0f min=%.4f cll=%.0f fall=%.0f\n",
-                        dp->max_luma, dp->min_luma, dp->max_cll, dp->max_fall);
+            if (dp && dp->max_luma > 0 && dp->ref_luma > 0) {
+                // Scale from display's reference white to libplacebo's
+                // PL_COLOR_SDR_WHITE (203). Matches wayland_common.c:info_done().
+                float a = dp->min_luma;
+                float b = (PL_COLOR_SDR_WHITE - PL_COLOR_HDR_BLACK) / (dp->ref_luma - a);
+                hdr_hint.hdr.min_luma = (dp->min_luma - a) * b + PL_COLOR_HDR_BLACK;
+                hdr_hint.hdr.max_luma = (dp->max_luma - a) * b + PL_COLOR_HDR_BLACK;
+                hdr_hint.hdr.max_cll = hdr_hint.hdr.max_luma;
+                hdr_hint.hdr.max_fall = hdr_hint.hdr.max_luma;
+                if (hdr_hint.hdr.min_luma < 0)
+                    hdr_hint.hdr.min_luma = 0;
+                MP_INFO(ctx, "Display: max=%.0f ref=%.0f -> scaled peak=%.0f min=%.4f\n",
+                        dp->max_luma, dp->ref_luma, hdr_hint.hdr.max_luma, hdr_hint.hdr.min_luma);
             }
             pl_swapchain_colorspace_hint(p->swapchain, &hdr_hint);
 
