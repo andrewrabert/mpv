@@ -138,6 +138,9 @@ struct gl_video_opts {
     int target_prim;
     int target_trc;
     int target_peak;
+    float target_min_luma;  // target display min luminance (nits)
+    float target_max_cll;   // target display max content light level (nits)
+    float target_max_fall;  // target display max frame average light level (nits)
     int hdr_reference_white;
     int sdr_adjust_gamma;
     int treat_srgb_as_power22;

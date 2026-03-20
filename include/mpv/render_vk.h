@@ -206,6 +206,17 @@ typedef struct mpv_vulkan_sync {
     uint64_t signal_value;
 } mpv_vulkan_sync;
 
+/**
+ * Display HDR profile passed via MPV_RENDER_PARAM_DISPLAY_PROFILE.
+ * Raw values from the compositor (nits). mpv handles the scaling
+ * to libplacebo's internal reference white (PL_COLOR_SDR_WHITE).
+ */
+typedef struct mpv_display_profile {
+    float max_luma;   // Display peak luminance (cd/m²)
+    float min_luma;   // Display black level (cd/m²)
+    float ref_luma;   // Display reference white (cd/m²), e.g. 252
+} mpv_display_profile;
+
 #ifdef __cplusplus
 }
 #endif

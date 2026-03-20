@@ -136,7 +136,42 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     int *flip_y = get_mpv_render_param(params, MPV_RENDER_PARAM_FLIP_Y, NULL);
     pl_video_set_flipped(p->video_engine, flip_y && *flip_y);
 
-    // Wrap the framebuffer object (FBO) for rendering.
+    // Swapchain path: libplacebo owns the swapchain and handles color management.
+    // This makes the rendering pipeline identical to standalone mpv.
+    MP_INFO(ctx, "render: swapchain=%p context=%p\n",
+            (void*)p->context->swapchain, (void*)p->context);
+    if (p->context->swapchain) {
+        // Resize swapchain to match window dimensions
+        int *size = get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_SWAPCHAIN_SIZE, NULL);
+        int sw_w = size ? size[0] : 0;
+        int sw_h = size ? size[1] : 0;
+        pl_swapchain_resize(p->context->swapchain, &sw_w, &sw_h);
+
+        struct pl_swapchain_frame sw_frame;
+        if (!pl_swapchain_start_frame(p->context->swapchain, &sw_frame)) {
+            MP_ERR(ctx, "pl_swapchain_start_frame failed\n");
+            return MPV_ERROR_GENERIC;
+        }
+
+        MP_INFO(ctx, "swapchain frame: %dx%d trc=%d prim=%d\n",
+               sw_frame.fbo->params.w, sw_frame.fbo->params.h,
+               sw_frame.color_space.transfer, sw_frame.color_space.primaries);
+
+        pl_video_render_to_swapchain(p->video_engine, frame,
+                                     sw_frame.fbo, &sw_frame.color_space);
+
+        if (!pl_swapchain_submit_frame(p->context->swapchain)) {
+            MP_ERR(ctx, "pl_swapchain_submit_frame failed\n");
+            return MPV_ERROR_GENERIC;
+        }
+
+        // Wait for previous frame to finish — provides vsync pacing and
+        // yields the render mutex so mpv's decoder/audio threads can work
+        pl_swapchain_swap_buffers(p->context->swapchain);
+        return 0;
+    }
+
+    // FBO path: user provides the render target.
     pl_tex target_tex = NULL;
     int err = p->context->fns->wrap_fbo(p->context, params, &target_tex);
     if (err < 0) return err;
@@ -228,13 +263,29 @@ static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
 {
     struct priv *p = ctx->priv;
     if (!p->context || !p->context->fns || !p->context->ra) return MPV_ERROR_UNINITIALIZED;
+
+    // Swapchain path: get size from params or query swapchain
+    if (p->context->swapchain) {
+        int *size = get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_SWAPCHAIN_SIZE, NULL);
+        int w = size ? size[0] : 0;
+        int h = size ? size[1] : 0;
+        if (w <= 0 || h <= 0) {
+            // Query current swapchain size as fallback
+            if (!pl_swapchain_resize(p->context->swapchain, &w, &h) || w <= 0 || h <= 0)
+                return MPV_ERROR_GENERIC;
+        }
+        *out_w = w;
+        *out_h = h;
+        return 0;
+    }
+
+    // FBO path
     pl_tex tex = NULL;
     int err = p->context->fns->wrap_fbo(p->context, params, &tex);
     if (err < 0) return err;
     if (!tex) return MPV_ERROR_GENERIC;
     *out_w = tex->params.w;
     *out_h = tex->params.h;
-    // Destroy the temporary wrapper texture via the RA.
     ra_next_tex_destroy(p->context->ra, &tex);
     return 0;
 }

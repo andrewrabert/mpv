@@ -452,6 +452,34 @@ typedef enum mpv_render_param_type {
      * See render_vk.h header.
      */
     MPV_RENDER_PARAM_VULKAN_SYNC = 24,
+
+    /**
+     * VkSurfaceKHR (VkSurfaceKHR*): Provide a Vulkan surface for libplacebo
+     * to create and manage a swapchain on. When set during render context
+     * creation, mpv creates a pl_swapchain on this surface instead of using
+     * the FBO render path. This makes the rendering pipeline identical to
+     * standalone mpv — libplacebo handles swapchain format selection, color
+     * management, and display profile negotiation via the Wayland compositor.
+     *
+     * When a swapchain is active, mpv_render_context_render() ignores
+     * MPV_RENDER_PARAM_VULKAN_FBO and renders to the swapchain directly.
+     * The caller should NOT create their own VkSwapchainKHR on this surface.
+     */
+    MPV_RENDER_PARAM_VULKAN_SURFACE = 25,
+
+    /**
+     * int[2] (width, height): Desired swapchain dimensions in pixels.
+     * Used with MPV_RENDER_PARAM_VULKAN_SURFACE to resize the swapchain
+     * when the window size changes. Pass on each render call.
+     */
+    MPV_RENDER_PARAM_VULKAN_SWAPCHAIN_SIZE = 26,
+
+    /**
+     * mpv_display_profile*: Display HDR profile for the swapchain.
+     * Scaled luminance values (relative to PL_COLOR_SDR_WHITE = 203 nits).
+     * Queried from the Wayland compositor by the host application.
+     */
+    MPV_RENDER_PARAM_DISPLAY_PROFILE = 27,
 } mpv_render_param_type;
 
 /**
