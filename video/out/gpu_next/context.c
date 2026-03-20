@@ -446,6 +446,7 @@ struct priv_vk {
     pl_vulkan vulkan;
     pl_gpu gpu;
     struct ra_next *ra;
+    pl_swapchain swapchain;  // Created when MPV_RENDER_PARAM_VULKAN_SURFACE is provided
 };
 
 /**
@@ -479,16 +480,12 @@ static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_rend
         return MPV_ERROR_INVALID_PARAMETER;
     }
 
-    // Setup libplacebo logging
+    // Setup libplacebo logging — always enabled for diagnostics
     struct pl_log_params log_params = {
-        .log_level = PL_LOG_DEBUG
+        .log_cb = pl_log_cb_vk,
+        .log_priv = ctx->log,
+        .log_level = PL_LOG_INFO,
     };
-
-    // Enable verbose logging if trace is enabled
-    if (mp_msg_test(ctx->log, MSGL_TRACE)) {
-        log_params.log_cb = pl_log_cb_vk;
-        log_params.log_priv = ctx->log;
-    }
 
     p->pl_log = pl_log_create(PL_API_VER, &log_params);
     if (!p->pl_log) {
@@ -524,10 +521,62 @@ static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_rend
 
     p->gpu = p->vulkan->gpu;
 
+    // If a VkSurface was provided, create a libplacebo swapchain on it.
+    // This makes the rendering path identical to standalone mpv — libplacebo
+    // handles swapchain format selection, color management, and display profile.
+    VkSurfaceKHR *surface_ptr =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_SURFACE, NULL);
+    if (surface_ptr && *surface_ptr) {
+        struct pl_vulkan_swapchain_params sw_params = {0};
+        sw_params.surface = *surface_ptr;
+        sw_params.present_mode = VK_PRESENT_MODE_FIFO_KHR;
+        p->swapchain = pl_vulkan_create_swapchain(p->vulkan, &sw_params);
+        if (p->swapchain) {
+            // Hint HDR with display profile from host application
+            struct pl_color_space hdr_hint = {
+                .primaries = PL_COLOR_PRIM_BT_2020,
+                .transfer = PL_COLOR_TRC_PQ,
+            };
+            mpv_display_profile *dp =
+                get_mpv_render_param(params, MPV_RENDER_PARAM_DISPLAY_PROFILE, NULL);
+            if (dp && dp->max_luma > 0) {
+                hdr_hint.hdr.min_luma = dp->min_luma;
+                hdr_hint.hdr.max_luma = dp->max_luma;
+                hdr_hint.hdr.max_cll = dp->max_cll;
+                hdr_hint.hdr.max_fall = dp->max_fall;
+                MP_INFO(ctx, "Display profile: peak=%.0f min=%.4f cll=%.0f fall=%.0f\n",
+                        dp->max_luma, dp->min_luma, dp->max_cll, dp->max_fall);
+            }
+            pl_swapchain_colorspace_hint(p->swapchain, &hdr_hint);
+
+            // Initial resize
+            int w = 1920, h = 1080;
+            pl_swapchain_resize(p->swapchain, &w, &h);
+
+            // Probe actual format by doing a test frame
+            struct pl_swapchain_frame test_frame;
+            if (pl_swapchain_start_frame(p->swapchain, &test_frame)) {
+                VkFormat fmt = VK_FORMAT_UNDEFINED;
+                pl_vulkan_unwrap(p->gpu, test_frame.fbo, &fmt, NULL);
+                MP_INFO(ctx, "Created libplacebo swapchain on provided VkSurface (%dx%d)\n", w, h);
+                MP_INFO(ctx, "Swapchain format: VkFormat=%d, trc=%d, prim=%d, peak=%.0f\n",
+                        fmt, test_frame.color_space.transfer, test_frame.color_space.primaries,
+                        test_frame.color_space.hdr.max_luma);
+                pl_swapchain_submit_frame(p->swapchain);
+            } else {
+                MP_INFO(ctx, "Created libplacebo swapchain on provided VkSurface (%dx%d)\n", w, h);
+            }
+        } else {
+            MP_WARN(ctx, "Failed to create swapchain on VkSurface, falling back to FBO mode\n");
+        }
+    }
+
     // Create the RA abstraction
     p->ra = ra_pl_create(p->gpu, ctx->log, p->pl_log);
     if (!p->ra) {
         MP_ERR(ctx, "Failed to create RA from pl_gpu\n");
+        if (p->swapchain)
+            pl_swapchain_destroy(&p->swapchain);
         pl_vulkan_destroy(&p->vulkan);
         pl_log_destroy(&p->pl_log);
         return MPV_ERROR_VO_INIT_FAILED;
@@ -535,6 +584,7 @@ static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_rend
 
     ctx->ra = p->ra;
     ctx->gpu = p->gpu;
+    ctx->swapchain = p->swapchain;  // NULL if no surface was provided
     return 0;
 }
 
@@ -614,6 +664,10 @@ static void libmpv_gpu_next_destroy_vk(struct libmpv_gpu_next_context *ctx)
 
     if (p->ra) {
         ra_pl_destroy(&p->ra);
+    }
+
+    if (p->swapchain) {
+        pl_swapchain_destroy(&p->swapchain);
     }
 
     if (p->vulkan) {

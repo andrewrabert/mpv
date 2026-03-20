@@ -1,7 +1,8 @@
 #pragma once
 
-#include "stdbool.h"         // for bool
-#include <libplacebo/gpu.h>  // for pl_gpu, pl_tex
+#include "stdbool.h"              // for bool
+#include <libplacebo/gpu.h>       // for pl_gpu, pl_tex
+#include <libplacebo/colorspace.h> // for pl_color_space
 
 // Forward declarations
 struct mp_image_params;
@@ -32,6 +33,15 @@ void pl_video_set_flipped(struct pl_video *p, bool flipped);
  * Synchronously renders a video frame to a display target using libplacebo.
  */
 void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex);
+
+/**
+ * Renders a video frame to a swapchain target with the swapchain's color space.
+ * Used when libplacebo owns the swapchain (MPV_RENDER_PARAM_VULKAN_SURFACE).
+ * The color_space comes from pl_swapchain_frame and includes the full display profile.
+ */
+void pl_video_render_to_swapchain(struct pl_video *p, struct vo_frame *frame,
+                                  pl_tex target_tex,
+                                  const struct pl_color_space *target_csp);
 
 /**
  * Synchronously renders `frame` into an sRGB temporary and returns a newly

@@ -1,7 +1,8 @@
 #pragma once
 
-#include <libplacebo/gpu.h>  // for pl_gpu, pl_tex
-#include "mpv/render.h"      // for mpv_render_param
+#include <libplacebo/gpu.h>       // for pl_gpu, pl_tex
+#include <libplacebo/swapchain.h> // for pl_swapchain
+#include "mpv/render.h"           // for mpv_render_param
 
 /**
  * This struct represents an instance of a specific API context implementation.
@@ -21,6 +22,9 @@ struct libmpv_gpu_next_context {
     struct ra_next *ra;
     // The underlying GPU object, needed by the Host for resource management.
     pl_gpu gpu;
+    // Optional: swapchain created from MPV_RENDER_PARAM_VULKAN_SURFACE.
+    // When non-NULL, rendering uses the swapchain instead of FBO wrapping.
+    pl_swapchain swapchain;
 };
 
 /**
