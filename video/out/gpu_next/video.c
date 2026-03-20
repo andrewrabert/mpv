@@ -460,172 +460,16 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
  * @param frame The mpv frame to render, containing the current image.
  * @param target_tex The destination GPU texture to render to.
  */
-void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex)
+static void render_to_target(struct pl_video *p, struct vo_frame *frame,
+                             pl_tex target_tex, const struct pl_color_space *color)
 {
-    // Get current options for target colorspace
-    m_config_cache_update(p->opts_cache);
-    const struct gl_video_opts *opts = p->opts_cache->opts;
-
-    // Determine target colorspace from options
-    struct pl_color_space target_color = pl_color_space_srgb;
-    if (opts->target_trc || opts->target_prim) {
-        target_color = (struct pl_color_space){
-            .primaries = opts->target_prim ? opts->target_prim : PL_COLOR_PRIM_BT_709,
-            .transfer = opts->target_trc ? opts->target_trc : PL_COLOR_TRC_SRGB,
-        };
-        // For HDR outputs, set the full target display profile.
-        // Standalone mpv gets these from the Wayland backend; for libmpv
-        // we pass them as options from the Wayland display query.
-        if (opts->target_peak > 0)
-            target_color.hdr.max_luma = opts->target_peak;
-        if (opts->target_min_luma > 0)
-            target_color.hdr.min_luma = opts->target_min_luma;
-        if (opts->target_max_cll > 0)
-            target_color.hdr.max_cll = opts->target_max_cll;
-        if (opts->target_max_fall > 0)
-            target_color.hdr.max_fall = opts->target_max_fall;
-    }
-
-    static int debug_once = 0;
-    if (!debug_once) {
-        debug_once = 1;
-        MP_INFO(p, "target colorspace: trc=%d prim=%d peak=%.0f\n",
-                target_color.transfer, target_color.primaries, target_color.hdr.max_luma);
-    }
-
-    // Describe the target surface for libplacebo.
-    // When flipped (OpenGL FBO), swap y0 and y1 to flip the output vertically.
     int crop_y0 = p->flipped ? p->current_dst.y1 : p->current_dst.y0;
     int crop_y1 = p->flipped ? p->current_dst.y0 : p->current_dst.y1;
     struct pl_frame target_frame = {
         .num_planes = 1,
         .planes[0] = { .texture = target_tex, .components = 4, .component_mapping = {0,1,2,3} },
         .crop = { .x0 = p->current_dst.x0, .y0 = crop_y0, .x1 = p->current_dst.x1, .y1 = crop_y1 },
-        .color = target_color,
-        .repr = pl_color_repr_rgb,
-    };
-
-    // The libmpv VO provides one new frame at a time in frame->current.
-    // We check the frame_id to avoid pushing duplicates.
-    if (frame && frame->current && frame->frame_id > p->last_frame_id) {
-        struct mp_image *mpi = mp_image_new_ref(frame->current);
-        // Attach our private data to the image for the callbacks.
-        struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
-        fp->p = p;
-        mpi->priv = fp;
-
-        // Push the frame into the queue with its callbacks.
-        ra_next_queue_push(p->queue, &(struct pl_source_frame) {
-            .pts = mpi->pts,
-            .frame_data = mpi,
-            .map = map_frame,
-            .unmap = unmap_frame,
-            .discard = discard_frame,
-        });
-
-        p->last_frame_id = frame->frame_id;
-    }
-
-    // If this is a redraw request, frame->current will be NULL. In that case,
-    // we reuse the last known PTS to query the queue for the correct frame.
-    double target_pts = (frame && frame->current) ? frame->current->pts : p->last_pts;
-    p->last_pts = target_pts;
-
-    struct pl_frame_mix queue_mix = {0};
-    struct pl_queue_params qparams = *pl_queue_params(.pts = target_pts);
-
-    ra_next_queue_update(p->queue, &queue_mix, &qparams);
-
-    // To render OSD, we need a representative source frame to get color space info.
-    // The first frame in the mix is a perfect candidate.
-    struct mp_image *representative_img = NULL;
-    if (queue_mix.num_frames > 0 && queue_mix.frames) {
-        representative_img = queue_mix.frames[0]->user_data;
-    }
-
-    // Manually build the final mix for the renderer, including the signatures.
-    // We need a local array to hold the signature data. 32 is a safe upper bound.
-    uint64_t signatures[32];
-    assert(queue_mix.num_frames < MP_ARRAY_SIZE(signatures));
-    for (int i = 0; i < queue_mix.num_frames; i++) {
-        // Use the mp_image pointer as a unique signature for caching.
-        signatures[i] = (uintptr_t)queue_mix.frames[i]->user_data;
-    }
-    struct pl_frame_mix mix = queue_mix;
-    mix.signatures = signatures;
-
-    // Apply source crop to all frames in the mix. This tells libplacebo
-    // which region of the decoded frame to render (e.g. MKV PixelCrop).
-    for (int i = 0; i < mix.num_frames; i++) {
-        struct pl_frame *image = (struct pl_frame *) mix.frames[i];
-        struct mp_image *mpi = image->user_data;
-        apply_crop(image, p->current_src, mpi->params.w, mpi->params.h);
-    }
-
-    // Generate and attach OSD overlays to the target frame. If mix.num_frames is 0,
-    // representative_img will be NULL, and update_overlays will correctly render
-    // OSD against a black background.
-    update_overlays(p, p->osd_res, 0, PL_OVERLAY_COORDS_DST_FRAME,
-                   &p->osd_state_storage, &target_frame, representative_img);
-
-    // For a simple, non-interpolating backend, we can assume the display
-    // frame's duration is equivalent to one source frame (1.0 in normalized time).
-    mix.vsync_duration = 1.0f;
-
-    // Prepare the rendering parameters for libplacebo
-    struct pl_render_params params = {
-        .upscaler = map_scaler(p, SCALER_SCALE),
-        .downscaler = map_scaler(p, SCALER_DSCALE),
-        .plane_upscaler = map_scaler(p, SCALER_CSCALE),
-    };
-
-    // Declare a local struct to hold the color adjustment values.
-    struct pl_color_adjustment color_adj;
-
-    // Query the current brightness/contrast/etc values from the equalizer
-    struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
-    mp_csp_equalizer_state_get(p->video_eq, &cparams);
-
-    // Fill our local struct with the values.
-    color_adj.brightness = cparams.brightness;
-    color_adj.contrast   = cparams.contrast;
-    color_adj.hue        = cparams.hue;
-    color_adj.saturation = cparams.saturation;
-    color_adj.gamma      = cparams.gamma;
-
-    // Point the render params' pointer to our local struct.
-    params.color_adjustment = &color_adj;
-
-    // Render the mix. libplacebo handles the empty mix case (no video) correctly.
-    if (!ra_next_render_image_mix(p->ra, &mix, &target_frame, &params)) {
-        mp_msg(p->log, MSGL_ERR, "Rendering failed.\n");
-    }
-}
-
-void pl_video_render_to_swapchain(struct pl_video *p, struct vo_frame *frame,
-                                  pl_tex target_tex,
-                                  const struct pl_color_space *target_csp)
-{
-    // Use the swapchain's color space directly as the rendering target.
-    // libplacebo's auto tone mapper handles both SDR→PQ and HDR passthrough.
-    struct pl_color_space target_color = target_csp ? *target_csp : pl_color_space_srgb;
-
-    static int debug_once_sw = 0;
-    if (!debug_once_sw) {
-        debug_once_sw = 1;
-        MP_INFO(p, "swapchain target: trc=%d prim=%d peak=%.0f min=%.4f cll=%.0f\n",
-                target_color.transfer, target_color.primaries,
-                target_color.hdr.max_luma, target_color.hdr.min_luma,
-                target_color.hdr.max_cll);
-    }
-
-    int crop_y0 = p->flipped ? p->current_dst.y1 : p->current_dst.y0;
-    int crop_y1 = p->flipped ? p->current_dst.y0 : p->current_dst.y1;
-    struct pl_frame target_frame = {
-        .num_planes = 1,
-        .planes[0] = { .texture = target_tex, .components = 4, .component_mapping = {0,1,2,3} },
-        .crop = { .x0 = p->current_dst.x0, .y0 = crop_y0, .x1 = p->current_dst.x1, .y1 = crop_y1 },
-        .color = target_color,
+        .color = *color,
         .repr = pl_color_repr_rgb,
     };
 
@@ -634,7 +478,6 @@ void pl_video_render_to_swapchain(struct pl_video *p, struct vo_frame *frame,
         struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
         fp->p = p;
         mpi->priv = fp;
-
         ra_next_queue_push(p->queue, &(struct pl_source_frame) {
             .pts = mpi->pts,
             .frame_data = mpi,
@@ -692,6 +535,60 @@ void pl_video_render_to_swapchain(struct pl_video *p, struct vo_frame *frame,
 
     if (!ra_next_render_image_mix(p->ra, &mix, &target_frame, &params))
         mp_msg(p->log, MSGL_ERR, "Rendering failed.\n");
+}
+
+void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex)
+{
+    // Get current options for target colorspace
+    m_config_cache_update(p->opts_cache);
+    const struct gl_video_opts *opts = p->opts_cache->opts;
+
+    // Determine target colorspace from options
+    struct pl_color_space target_color = pl_color_space_srgb;
+    if (opts->target_trc || opts->target_prim) {
+        target_color = (struct pl_color_space){
+            .primaries = opts->target_prim ? opts->target_prim : PL_COLOR_PRIM_BT_709,
+            .transfer = opts->target_trc ? opts->target_trc : PL_COLOR_TRC_SRGB,
+        };
+        // For HDR outputs, set the full target display profile.
+        // Standalone mpv gets these from the Wayland backend; for libmpv
+        // we pass them as options from the Wayland display query.
+        if (opts->target_peak > 0)
+            target_color.hdr.max_luma = opts->target_peak;
+        if (opts->target_min_luma > 0)
+            target_color.hdr.min_luma = opts->target_min_luma;
+        if (opts->target_max_cll > 0)
+            target_color.hdr.max_cll = opts->target_max_cll;
+        if (opts->target_max_fall > 0)
+            target_color.hdr.max_fall = opts->target_max_fall;
+    }
+
+    static int debug_once = 0;
+    if (!debug_once) {
+        debug_once = 1;
+        MP_INFO(p, "target colorspace: trc=%d prim=%d peak=%.0f\n",
+                target_color.transfer, target_color.primaries, target_color.hdr.max_luma);
+    }
+
+    render_to_target(p, frame, target_tex, &target_color);
+}
+
+void pl_video_render_to_swapchain(struct pl_video *p, struct vo_frame *frame,
+                                  pl_tex target_tex,
+                                  const struct pl_color_space *target_csp)
+{
+    struct pl_color_space target_color = target_csp ? *target_csp : pl_color_space_srgb;
+
+    static int debug_once_sw = 0;
+    if (!debug_once_sw) {
+        debug_once_sw = 1;
+        MP_INFO(p, "swapchain target: trc=%d prim=%d peak=%.0f min=%.4f cll=%.0f\n",
+                target_color.transfer, target_color.primaries,
+                target_color.hdr.max_luma, target_color.hdr.min_luma,
+                target_color.hdr.max_cll);
+    }
+
+    render_to_target(p, frame, target_tex, &target_color);
 }
 
  /**
