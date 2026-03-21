@@ -555,8 +555,8 @@ static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_rend
             }
             pl_swapchain_colorspace_hint(p->swapchain, &hdr_hint);
 
-            // Initial resize
-            int w = 1920, h = 1080;
+            // Initial resize (0 = use surface's current extent)
+            int w = 0, h = 0;
             pl_swapchain_resize(p->swapchain, &w, &h);
 
             // Probe actual format by doing a test frame
