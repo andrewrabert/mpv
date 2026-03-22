@@ -138,8 +138,6 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
 
     // Swapchain path: libplacebo owns the swapchain and handles color management.
     // This makes the rendering pipeline identical to standalone mpv.
-    MP_INFO(ctx, "render: swapchain=%p context=%p\n",
-            (void*)p->context->swapchain, (void*)p->context);
     if (p->context->swapchain) {
         // Resize swapchain to match window dimensions
         int *size = get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_SWAPCHAIN_SIZE, NULL);
@@ -152,10 +150,6 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
             MP_ERR(ctx, "pl_swapchain_start_frame failed\n");
             return MPV_ERROR_GENERIC;
         }
-
-        MP_INFO(ctx, "swapchain frame: %dx%d trc=%d prim=%d\n",
-               sw_frame.fbo->params.w, sw_frame.fbo->params.h,
-               sw_frame.color_space.transfer, sw_frame.color_space.primaries);
 
         pl_video_render_to_swapchain(p->video_engine, frame,
                                      sw_frame.fbo, &sw_frame.color_space);
