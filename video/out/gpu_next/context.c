@@ -532,28 +532,39 @@ static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_rend
         sw_params.present_mode = VK_PRESENT_MODE_FIFO_KHR;
         p->swapchain = pl_vulkan_create_swapchain(p->vulkan, &sw_params);
         if (p->swapchain) {
-            // Hint HDR with display profile from host application
-            struct pl_color_space hdr_hint = {
-                .primaries = PL_COLOR_PRIM_BT_2020,
-                .transfer = PL_COLOR_TRC_PQ,
-            };
+            // Store pointer to live display profile for per-frame target
+            // override. The profile is updated by preferred_changed events
+            // from the compositor, so we read it per-frame instead of
+            // pre-computing at init time.
             mpv_display_profile *dp =
                 get_mpv_render_param(params, MPV_RENDER_PARAM_DISPLAY_PROFILE, NULL);
-            if (dp && dp->max_luma > 0 && dp->ref_luma > 0) {
-                // Scale from display's reference white to libplacebo's
-                // PL_COLOR_SDR_WHITE (203). Matches wayland_common.c:info_done().
-                float a = dp->min_luma;
-                float b = (PL_COLOR_SDR_WHITE - PL_COLOR_HDR_BLACK) / (dp->ref_luma - a);
-                hdr_hint.hdr.min_luma = (dp->min_luma - a) * b + PL_COLOR_HDR_BLACK;
-                hdr_hint.hdr.max_luma = (dp->max_luma - a) * b + PL_COLOR_HDR_BLACK;
-                hdr_hint.hdr.max_cll = hdr_hint.hdr.max_luma;
-                hdr_hint.hdr.max_fall = hdr_hint.hdr.max_luma;
-                if (hdr_hint.hdr.min_luma < 0)
-                    hdr_hint.hdr.min_luma = 0;
-                MP_INFO(ctx, "Display: max=%.0f ref=%.0f -> scaled peak=%.0f min=%.4f\n",
-                        dp->max_luma, dp->ref_luma, hdr_hint.hdr.max_luma, hdr_hint.hdr.min_luma);
+            if (dp) {
+                ctx->display_profile = dp;
+                // Write swapchain back so the platform surface can re-hint
+                // when preferred_changed fires with updated HDR metadata.
+                dp->swapchain_out = (void*)p->swapchain;
+
+                // Initial HDR hint to negotiate swapchain format.
+                // The per-frame hint in render() will refine this.
+                if (dp->max_luma > 0 && dp->ref_luma > 0) {
+                    float a = dp->min_luma;
+                    float b = (PL_COLOR_SDR_WHITE - PL_COLOR_HDR_BLACK) / (dp->ref_luma - a);
+                    struct pl_color_space hdr_hint = {
+                        .primaries = PL_COLOR_PRIM_BT_2020,
+                        .transfer = PL_COLOR_TRC_PQ,
+                    };
+                    hdr_hint.hdr.min_luma = (dp->min_luma - a) * b + PL_COLOR_HDR_BLACK;
+                    hdr_hint.hdr.max_luma = (dp->max_luma - a) * b + PL_COLOR_HDR_BLACK;
+                    hdr_hint.hdr.max_cll = hdr_hint.hdr.max_luma;
+                    hdr_hint.hdr.max_fall = hdr_hint.hdr.max_luma;
+                    if (hdr_hint.hdr.min_luma < 0)
+                        hdr_hint.hdr.min_luma = 0;
+                    MP_INFO(ctx, "Display: max=%.0f ref=%.0f -> scaled peak=%.0f min=%.4f\n",
+                            dp->max_luma, dp->ref_luma,
+                            hdr_hint.hdr.max_luma, hdr_hint.hdr.min_luma);
+                    pl_swapchain_colorspace_hint(p->swapchain, &hdr_hint);
+                }
             }
-            pl_swapchain_colorspace_hint(p->swapchain, &hdr_hint);
 
             // Initial resize (0 = use surface's current extent)
             int w = 0, h = 0;
@@ -575,6 +586,15 @@ static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_rend
         } else {
             MP_WARN(ctx, "Failed to create swapchain on VkSurface, falling back to FBO mode\n");
         }
+    }
+
+    // Store display profile for FBO path (no swapchain).
+    // video.c writes content mastering metadata here per-frame.
+    if (!ctx->display_profile) {
+        mpv_display_profile *dp =
+            get_mpv_render_param(params, MPV_RENDER_PARAM_DISPLAY_PROFILE, NULL);
+        if (dp)
+            ctx->display_profile = dp;
     }
 
     // Create the RA abstraction

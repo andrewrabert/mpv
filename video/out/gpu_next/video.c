@@ -1,5 +1,6 @@
 #include "video.h"
 #include <libplacebo/utils/frame_queue.h>  // for pl_source_frame, pl_queue_...
+#include <libplacebo/utils/libav.h>        // for pl_film_grain_from_av
 #include <math.h>                          // for isnan
 #include <stddef.h>                        // for NULL
 #include <stdint.h>                        // for uint64_t, uint32_t, uintptr_t
@@ -118,18 +119,44 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
 
+    // Guess missing colorspace metadata (primaries, transfer, levels)
+    // before frame init — matches vo_gpu_next.c line 697.
+    struct mp_image_params par = mpi->params;
+    mp_image_params_guess_csp(&par);
+
     // Use the RA helper to upload the mp_image data to a new set of textures
     // and populate the pl_frame struct with the result.
     if (!ra_upload_mp_image(p->ra, frame, mpi)) {
-        talloc_free(mpi); // Clean up the mp_image reference on failure
+        talloc_free(mpi);
         return false;
     }
 
-    // Set rotation so libplacebo can undo mpv's pre-rotated crop rects.
-    frame->rotation = mpi->params.rotate / 90;
+    // Apply guessed colorspace to the frame (ra_upload uses mpi->params
+    // directly, so we override with the guessed values).
+    frame->color = par.color;
+    frame->repr = par.repr;
+    frame->rotation = par.rotate / 90;
 
-    // Store a pointer back to the original mp_image. This is used to get a unique
-    // signature for the frame and to access metadata (like colorspace) later.
+    // Match vo_gpu_next.c: treat source sRGB as pure gamma 2.2 (the sRGB
+    // reference display EOTF per IEC 61966-2-1). Default in mpv is
+    // treat_srgb_as_power22 = 1|2|4 (auto, all bits set).
+    if (frame->color.transfer == PL_COLOR_TRC_SRGB)
+        frame->color.transfer = PL_COLOR_TRC_GAMMA22;
+
+    // ICC profile from source (rare for video, common for still images)
+    frame->profile = (struct pl_icc_profile){
+        .data = mpi->icc_profile ? mpi->icc_profile->data : NULL,
+        .len = mpi->icc_profile ? mpi->icc_profile->size : 0,
+    };
+    pl_icc_profile_compute_signature(&frame->profile);
+
+    // Chroma location for correct 4:2:0 upsampling
+    pl_frame_set_chroma_location(frame, par.chroma_location);
+
+    // Film grain synthesis
+    if (mpi->film_grain)
+        pl_film_grain_from_av(&frame->film_grain, (AVFilmGrainParams *) mpi->film_grain->data);
+
     frame->user_data = mpi;
     return true;
 }
@@ -461,17 +488,40 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
  * @param target_tex The destination GPU texture to render to.
  */
 static void render_to_target(struct pl_video *p, struct vo_frame *frame,
-                             pl_tex target_tex, const struct pl_color_space *color)
+                             struct pl_frame *target_frame)
 {
     int crop_y0 = p->flipped ? p->current_dst.y1 : p->current_dst.y0;
     int crop_y1 = p->flipped ? p->current_dst.y0 : p->current_dst.y1;
-    struct pl_frame target_frame = {
-        .num_planes = 1,
-        .planes[0] = { .texture = target_tex, .components = 4, .component_mapping = {0,1,2,3} },
-        .crop = { .x0 = p->current_dst.x0, .y0 = crop_y0, .x1 = p->current_dst.x1, .y1 = crop_y1 },
-        .color = *color,
-        .repr = pl_color_repr_rgb,
+    target_frame->crop = (struct pl_rect2df){
+        .x0 = p->current_dst.x0, .y0 = crop_y0,
+        .x1 = p->current_dst.x1, .y1 = crop_y1,
     };
+
+    // Match vo_gpu_next.c apply_target_options: set output levels to full range
+    target_frame->repr.levels = PL_COLOR_LEVELS_FULL;
+
+    // Match vo_gpu_next.c: treat_srgb_as_power22 & 2 (default on) — treat
+    // target sRGB as pure gamma 2.2 (IEC 61966-2-1 reference display).
+    if (target_frame->color.transfer == PL_COLOR_TRC_SRGB)
+        target_frame->color.transfer = PL_COLOR_TRC_GAMMA22;
+
+    // Match vo_gpu_next.c sdr_adjust_gamma: when target uses a gamma curve
+    // and source uses a compatible curve, use source's TRC directly to avoid
+    // unnecessary gamma roundtrip.
+    if ((target_frame->color.transfer == PL_COLOR_TRC_GAMMA22 ||
+         target_frame->color.transfer == PL_COLOR_TRC_SRGB) &&
+        frame && frame->current)
+    {
+        switch (frame->current->params.color.transfer) {
+        case PL_COLOR_TRC_BT_1886:
+        case PL_COLOR_TRC_GAMMA22:
+        case PL_COLOR_TRC_SRGB:
+            target_frame->color.transfer = frame->current->params.color.transfer;
+            break;
+        default:
+            break;
+        }
+    }
 
     if (frame && frame->current && frame->frame_id > p->last_frame_id) {
         struct mp_image *mpi = mp_image_new_ref(frame->current);
@@ -513,7 +563,7 @@ static void render_to_target(struct pl_video *p, struct vo_frame *frame,
     }
 
     update_overlays(p, p->osd_res, 0, PL_OVERLAY_COORDS_DST_FRAME,
-                   &p->osd_state_storage, &target_frame, representative_img);
+                   &p->osd_state_storage, target_frame, representative_img);
 
     mix.vsync_duration = 1.0f;
 
@@ -521,23 +571,29 @@ static void render_to_target(struct pl_video *p, struct vo_frame *frame,
         .upscaler = map_scaler(p, SCALER_SCALE),
         .downscaler = map_scaler(p, SCALER_DSCALE),
         .plane_upscaler = map_scaler(p, SCALER_CSCALE),
+        .peak_detect_params = &pl_peak_detect_default_params,
+        .dither_params = &pl_dither_default_params,
+        .sigmoid_params = &pl_sigmoid_default_params,
     };
 
-    struct pl_color_adjustment color_adj;
     struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
     mp_csp_equalizer_state_get(p->video_eq, &cparams);
-    color_adj.brightness = cparams.brightness;
-    color_adj.contrast   = cparams.contrast;
-    color_adj.hue        = cparams.hue;
-    color_adj.saturation = cparams.saturation;
-    color_adj.gamma      = cparams.gamma;
+    struct pl_color_adjustment color_adj = {
+        .brightness  = cparams.brightness,
+        .contrast    = cparams.contrast,
+        .hue         = cparams.hue,
+        .saturation  = cparams.saturation,
+        .gamma       = cparams.gamma,
+        .temperature = 0,
+    };
     params.color_adjustment = &color_adj;
 
-    if (!ra_next_render_image_mix(p->ra, &mix, &target_frame, &params))
+    if (!ra_next_render_image_mix(p->ra, &mix, target_frame, &params))
         mp_msg(p->log, MSGL_ERR, "Rendering failed.\n");
 }
 
-void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex)
+void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex,
+                     const mpv_display_profile *display_profile)
 {
     // Get current options for target colorspace
     m_config_cache_update(p->opts_cache);
@@ -550,9 +606,6 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
             .primaries = opts->target_prim ? opts->target_prim : PL_COLOR_PRIM_BT_709,
             .transfer = opts->target_trc ? opts->target_trc : PL_COLOR_TRC_SRGB,
         };
-        // For HDR outputs, set the full target display profile.
-        // Standalone mpv gets these from the Wayland backend; for libmpv
-        // we pass them as options from the Wayland display query.
         if (opts->target_peak > 0)
             target_color.hdr.max_luma = opts->target_peak;
         if (opts->target_min_luma > 0)
@@ -563,32 +616,87 @@ void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_t
             target_color.hdr.max_fall = opts->target_max_fall;
     }
 
-    static int debug_once = 0;
-    if (!debug_once) {
-        debug_once = 1;
-        MP_INFO(p, "target colorspace: trc=%d prim=%d peak=%.0f\n",
-                target_color.transfer, target_color.primaries, target_color.hdr.max_luma);
+    // PQ passthrough: when target is HDR and no explicit target-peak option,
+    // copy source HDR metadata to target so libplacebo sees matching peaks
+    // and passes through without tone mapping. Write content peak to the
+    // display profile so the platform layer can set the surface image
+    // description with the content's actual mastering metadata.
+    // Matches standalone mpv's --target-colorspace-hint=yes.
+    bool passthrough = pl_color_transfer_is_hdr(target_color.transfer) &&
+                       !target_color.hdr.max_luma && !opts->target_peak;
+    if (passthrough && frame && frame->current) {
+        target_color.hdr = frame->current->params.color.hdr;
+        if (display_profile) {
+            mpv_display_profile *dp = (mpv_display_profile *)display_profile;
+            dp->content_peak = target_color.hdr.max_luma;
+            dp->content_min_luma = target_color.hdr.min_luma;
+            dp->content_max_cll = target_color.hdr.max_cll;
+            dp->content_max_fall = target_color.hdr.max_fall;
+        }
+    } else if (display_profile && display_profile->max_luma > 0 && display_profile->ref_luma > 0) {
+        // Tone mapping fallback: apply display profile HDR metadata.
+        float a = display_profile->min_luma;
+        float b = (PL_COLOR_SDR_WHITE - PL_COLOR_HDR_BLACK) / (display_profile->ref_luma - a);
+        target_color.hdr.min_luma = (display_profile->min_luma - a) * b + PL_COLOR_HDR_BLACK;
+        target_color.hdr.max_luma = (display_profile->max_luma - a) * b + PL_COLOR_HDR_BLACK;
+        target_color.hdr.max_cll = target_color.hdr.max_luma;
+        target_color.hdr.max_fall = target_color.hdr.max_luma;
+        if (target_color.hdr.min_luma < 0)
+            target_color.hdr.min_luma = 0;
     }
 
-    render_to_target(p, frame, target_tex, &target_color);
+    static int debug_once = 0;
+    if (!debug_once && frame && frame->current) {
+        debug_once = 1;
+        struct pl_hdr_metadata src_hdr = frame->current->params.color.hdr;
+        MP_INFO(p, "target colorspace: trc=%d prim=%d peak=%.0f\n",
+                target_color.transfer, target_color.primaries, target_color.hdr.max_luma);
+        MP_INFO(p, "source hdr: max_luma=%.0f min_luma=%.4f max_cll=%.0f max_fall=%.0f\n",
+                src_hdr.max_luma, src_hdr.min_luma, src_hdr.max_cll, src_hdr.max_fall);
+    }
+
+    struct pl_frame target = {
+        .num_planes = 1,
+        .planes[0] = { .texture = target_tex, .components = 4, .component_mapping = {0,1,2,3} },
+        .color = target_color,
+        .repr = pl_color_repr_rgb,
+    };
+    render_to_target(p, frame, &target);
 }
 
 void pl_video_render_to_swapchain(struct pl_video *p, struct vo_frame *frame,
-                                  pl_tex target_tex,
-                                  const struct pl_color_space *target_csp)
+                                  const struct pl_swapchain_frame *sw_frame,
+                                  const mpv_display_profile *display_profile)
 {
-    struct pl_color_space target_color = target_csp ? *target_csp : pl_color_space_srgb;
+    struct pl_frame target;
+    pl_frame_from_swapchain(&target, sw_frame);
+
+    // Override swapchain's default HDR metadata with actual display
+    // capabilities, matching standalone mpv's target.color = hint
+    // (vo_gpu_next.c line 1261). Scale from display's reference white
+    // to libplacebo's PL_COLOR_SDR_WHITE, same as wayland_common.c info_done().
+    // Read per-frame so preferred_changed updates take effect immediately.
+    if (display_profile && display_profile->max_luma > 0 && display_profile->ref_luma > 0) {
+        float a = display_profile->min_luma;
+        float b = (PL_COLOR_SDR_WHITE - PL_COLOR_HDR_BLACK) / (display_profile->ref_luma - a);
+        target.color.hdr.min_luma = (display_profile->min_luma - a) * b + PL_COLOR_HDR_BLACK;
+        target.color.hdr.max_luma = (display_profile->max_luma - a) * b + PL_COLOR_HDR_BLACK;
+        target.color.hdr.max_cll = target.color.hdr.max_luma;
+        target.color.hdr.max_fall = target.color.hdr.max_luma;
+        if (target.color.hdr.min_luma < 0)
+            target.color.hdr.min_luma = 0;
+    }
 
     static int debug_once_sw = 0;
     if (!debug_once_sw) {
         debug_once_sw = 1;
-        MP_INFO(p, "swapchain target: trc=%d prim=%d peak=%.0f min=%.4f cll=%.0f\n",
-                target_color.transfer, target_color.primaries,
-                target_color.hdr.max_luma, target_color.hdr.min_luma,
-                target_color.hdr.max_cll);
+        MP_INFO(p, "swapchain target: trc=%d prim=%d peak=%.0f min=%.4f bits=%d/%d\n",
+                target.color.transfer, target.color.primaries,
+                target.color.hdr.max_luma, target.color.hdr.min_luma,
+                target.repr.bits.color_depth, target.repr.bits.sample_depth);
     }
 
-    render_to_target(p, frame, target_tex, &target_color);
+    render_to_target(p, frame, &target);
 }
 
  /**

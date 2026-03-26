@@ -3,6 +3,8 @@
 #include "stdbool.h"              // for bool
 #include <libplacebo/gpu.h>       // for pl_gpu, pl_tex
 #include <libplacebo/colorspace.h> // for pl_color_space
+#include <libplacebo/swapchain.h>  // for pl_swapchain_frame
+#include "mpv/render_vk.h"       // for mpv_display_profile
 
 // Forward declarations
 struct mp_image_params;
@@ -31,17 +33,21 @@ void pl_video_set_flipped(struct pl_video *p, bool flipped);
 
 /**
  * Synchronously renders a video frame to a display target using libplacebo.
+ * If display_profile is non-NULL, applies HDR metadata to the target frame.
  */
-void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex);
+void pl_video_render(struct pl_video *p, struct vo_frame *frame, pl_tex target_tex,
+                     const mpv_display_profile *display_profile);
 
 /**
- * Renders a video frame to a swapchain target with the swapchain's color space.
- * Used when libplacebo owns the swapchain (MPV_RENDER_PARAM_VULKAN_SURFACE).
- * The color_space comes from pl_swapchain_frame and includes the full display profile.
+ * Renders a video frame to a swapchain target.
+ * Uses pl_frame_from_swapchain to initialize the target frame with proper
+ * color space, repr, and bit depth from the swapchain — matching vo_gpu_next.c.
+ * If display_profile is non-NULL, scales and applies HDR metadata to the
+ * target frame (matching standalone mpv's target.color = hint).
  */
 void pl_video_render_to_swapchain(struct pl_video *p, struct vo_frame *frame,
-                                  pl_tex target_tex,
-                                  const struct pl_color_space *target_csp);
+                                  const struct pl_swapchain_frame *sw_frame,
+                                  const mpv_display_profile *display_profile);
 
 /**
  * Synchronously renders `frame` into an sRGB temporary and returns a newly

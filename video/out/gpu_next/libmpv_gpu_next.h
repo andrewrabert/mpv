@@ -25,6 +25,10 @@ struct libmpv_gpu_next_context {
     // Optional: swapchain created from MPV_RENDER_PARAM_VULKAN_SURFACE.
     // When non-NULL, rendering uses the swapchain instead of FBO wrapping.
     pl_swapchain swapchain;
+    // Pointer to live display profile (owned by the platform surface).
+    // Read per-frame to get current HDR metadata after preferred_changed
+    // events update it. Scaled to libplacebo reference in the render path.
+    const void *display_profile; // mpv_display_profile*, avoids header dep
 };
 
 /**

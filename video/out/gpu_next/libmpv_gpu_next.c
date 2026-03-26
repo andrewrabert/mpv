@@ -11,6 +11,7 @@
 #include "string.h"             // for strcmp
 #include "ta/ta_talloc.h"       // for talloc_free, talloc_zero
 #include "video.h"              // for pl_video_check_format, pl_video_init
+#include "video/mp_image.h"     // for mp_image (per-frame colorspace hint)
 #include "video/hwdec.h"        // for hwdec_devices_create, hwdec_devices_d...
 #include "video/out/libmpv.h"   // for render_backend, get_mpv_render_param
 #include "video/out/vo.h"       // for vo_frame (ptr only), voctrl_screenshot
@@ -137,7 +138,6 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     pl_video_set_flipped(p->video_engine, flip_y && *flip_y);
 
     // Swapchain path: libplacebo owns the swapchain and handles color management.
-    // This makes the rendering pipeline identical to standalone mpv.
     if (p->context->swapchain) {
         // Resize swapchain to match window dimensions
         int *size = get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_SWAPCHAIN_SIZE, NULL);
@@ -151,8 +151,8 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
             return MPV_ERROR_GENERIC;
         }
 
-        pl_video_render_to_swapchain(p->video_engine, frame,
-                                     sw_frame.fbo, &sw_frame.color_space);
+        pl_video_render_to_swapchain(p->video_engine, frame, &sw_frame,
+                                     p->context->display_profile);
 
         if (!pl_swapchain_submit_frame(p->context->swapchain)) {
             MP_ERR(ctx, "pl_swapchain_submit_frame failed\n");
@@ -171,8 +171,8 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     if (err < 0) return err;
     if (!target_tex) return MPV_ERROR_GENERIC;
 
-    // Render the video frame.
-    pl_video_render(p->video_engine, frame, target_tex);
+    // Render the video frame with live display profile for HDR metadata.
+    pl_video_render(p->video_engine, frame, target_tex, p->context->display_profile);
 
     // Destroy the temporary wrapper texture via the RA.
     ra_next_tex_destroy(p->context->ra, &target_tex);

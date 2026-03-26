@@ -215,6 +215,19 @@ typedef struct mpv_display_profile {
     float max_luma;   // Display peak luminance (cd/m²)
     float min_luma;   // Display black level (cd/m²)
     float ref_luma;   // Display reference white (cd/m²), e.g. 252
+    // Output: set by context.c to the created pl_swapchain, so the platform
+    // surface can re-hint it when preferred_changed fires with new values.
+    void *swapchain_out;
+    // Output: written per-frame by video.c with content mastering metadata.
+    // Platform layer reads these to set the surface image description,
+    // matching Mesa's WSI set_mastering_luminance + set_max_cll.
+    float content_peak;       // source max_luma (cd/m², 0=unknown)
+    float content_min_luma;   // source min_luma (cd/m², 0=unknown)
+    float content_max_cll;    // MaxCLL (cd/m², 0=unknown)
+    float content_max_fall;   // MaxFALL (cd/m², 0=unknown)
+    // Display target primaries (CIE 1931 xy, from compositor preferred description)
+    // Platform layer fills these from info_target_primaries callback.
+    struct { float x, y; } target_prim_r, target_prim_g, target_prim_b, target_prim_w;
 } mpv_display_profile;
 
 #ifdef __cplusplus
