@@ -2,6 +2,7 @@
 #include <stddef.h>             // for NULL
 #include "common/msg.h"         // for mp_log_new, MP_ERR
 #include "config.h"             // for HAVE_GL
+#include "libplacebo/colorspace.h" // for pl_color_transfer_is_hdr
 #include "libplacebo/config.h"  // for PL_HAVE_OPENGL
 #include "libplacebo/gpu.h"     // for pl_tex, pl_tex_params, pl_tex_t
 #include "mpv/client.h"         // for mpv_error
@@ -11,7 +12,7 @@
 #include "string.h"             // for strcmp
 #include "ta/ta_talloc.h"       // for talloc_free, talloc_zero
 #include "video.h"              // for pl_video_check_format, pl_video_init
-#include "video/mp_image.h"     // for mp_image (per-frame colorspace hint)
+#include "video/mp_image.h"     // for mp_image
 #include "video/hwdec.h"        // for hwdec_devices_create, hwdec_devices_d...
 #include "video/out/libmpv.h"   // for render_backend, get_mpv_render_param
 #include "video/out/vo.h"       // for vo_frame (ptr only), voctrl_screenshot
@@ -144,6 +145,28 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
         int sw_w = size ? size[0] : 0;
         int sw_h = size ? size[1] : 0;
         pl_swapchain_resize(p->context->swapchain, &sw_w, &sw_h);
+
+        // Per-frame colorspace hint — only when the platform provided a
+        // display_profile, indicating it manages color. Without one, the
+        // WSI handles color management (e.g. Mesa on Wayland SDR).
+        //
+        // When display_profile has luminance data, the platform owns the
+        // hint (Wayland dmabuf path sets the image description directly).
+        // Otherwise, hint with source content so libplacebo picks an
+        // HDR-capable swapchain format (e.g. RGBA16F on macOS).
+        const mpv_display_profile *dp = p->context->display_profile;
+        bool platform_owns_hint = dp && dp->max_luma > 0 && dp->ref_luma > 0;
+        if (dp && !platform_owns_hint && frame && frame->current) {
+            const struct pl_color_space *source = &frame->current->params.color;
+            if (pl_color_transfer_is_hdr(source->transfer)) {
+                struct pl_color_space hint = *source;
+                if (!hint.hdr.max_cll)
+                    hint.hdr.max_cll = hint.hdr.max_luma;
+                pl_swapchain_colorspace_hint(p->context->swapchain, &hint);
+            } else {
+                pl_swapchain_colorspace_hint(p->context->swapchain, NULL);
+            }
+        }
 
         struct pl_swapchain_frame sw_frame;
         if (!pl_swapchain_start_frame(p->context->swapchain, &sw_frame)) {
