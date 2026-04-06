@@ -104,15 +104,25 @@ static int vulkan_init(struct ra_hwdec *hw)
     device_ctx->user_opaque = (void *)vk->vulkan;
     device_hwctx->lock_queue = lock_queue;
     device_hwctx->unlock_queue = unlock_queue;
-    device_hwctx->get_proc_addr = vk->vkinst->get_proc_addr;
-    device_hwctx->inst = vk->vkinst->instance;
+    // In the libmpv import path vkinst is NULL — pl_vulkan has the same fields.
+    device_hwctx->get_proc_addr = vk->vkinst
+        ? vk->vkinst->get_proc_addr : vk->vulkan->get_proc_addr;
+    device_hwctx->inst = vk->vkinst
+        ? vk->vkinst->instance : vk->vulkan->instance;
     device_hwctx->phys_dev = vk->vulkan->phys_device;
     device_hwctx->act_dev = vk->vulkan->device;
     device_hwctx->device_features = *vk->vulkan->features;
-    device_hwctx->enabled_inst_extensions = vk->vkinst->extensions;
-    device_hwctx->nb_enabled_inst_extensions = vk->vkinst->num_extensions;
-    device_hwctx->enabled_dev_extensions = vk->vulkan->extensions;
-    device_hwctx->nb_enabled_dev_extensions = vk->vulkan->num_extensions;
+    device_hwctx->enabled_inst_extensions = vk->vkinst
+        ? vk->vkinst->extensions : NULL;
+    device_hwctx->nb_enabled_inst_extensions = vk->vkinst
+        ? vk->vkinst->num_extensions : 0;
+    // Prefer the full extension list from the embedder (libmpv import path)
+    // over pl_vulkan->extensions which only includes what libplacebo uses.
+    // FFmpeg needs to see video decode extensions for zero-copy hwdec.
+    device_hwctx->enabled_dev_extensions = vk->dev_extensions
+        ? vk->dev_extensions : vk->vulkan->extensions;
+    device_hwctx->nb_enabled_dev_extensions = vk->dev_extensions
+        ? vk->num_dev_extensions : vk->vulkan->num_extensions;
 
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 34, 100)
     device_hwctx->nb_qf = 0;

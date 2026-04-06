@@ -36,4 +36,11 @@ struct mpvk_ctx {
     pl_gpu gpu; // points to vulkan->gpu for convenience
     pl_swapchain swapchain;
     VkSurfaceKHR surface;
+
+    // Full device extension list from the embedder (libmpv import path).
+    // pl_vulkan_import() filters extensions to only those libplacebo uses,
+    // but hwdec needs the full list (e.g. video decode extensions) for FFmpeg.
+    // NULL when using the standard VO path (vkinst != NULL).
+    const char *const *dev_extensions;
+    int num_dev_extensions;
 };

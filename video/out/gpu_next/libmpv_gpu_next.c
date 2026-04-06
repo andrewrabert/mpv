@@ -6,12 +6,18 @@
 #include "libplacebo/gpu.h"     // for pl_tex, pl_tex_params, pl_tex_t
 #include "mpv/client.h"         // for mpv_error
 #include "mpv/render.h"         // for mpv_render_param, mpv_render_param_type
+#if HAVE_VULKAN
+#include "mpv/render_vk.h"     // for mpv_vulkan_fbo
+#endif
 #include "ra.h"                 // for ra_next_tex_destroy
 #include "stdbool.h"            // for bool, false
 #include "string.h"             // for strcmp
 #include "ta/ta_talloc.h"       // for talloc_free, talloc_zero
 #include "video.h"              // for pl_video_check_format, pl_video_init
 #include "video/hwdec.h"        // for hwdec_devices_create, hwdec_devices_d...
+#include "video/out/gpu/context.h" // for struct ra_ctx
+#include "video/out/gpu/hwdec.h" // for ra_hwdec_ctx, ra_hwdec_ctx_init
+#include "video/out/gpu/ra.h"   // for ra_add_native_resource
 #include "video/out/libmpv.h"   // for render_backend, get_mpv_render_param
 #include "video/out/vo.h"       // for vo_frame (ptr only), voctrl_screenshot
 
@@ -28,6 +34,10 @@ struct mp_rect;
 struct priv {
     struct libmpv_gpu_next_context *context; // Manages the API (e.g., OpenGL)
     struct pl_video *video_engine;           // Manages synchronous libplacebo rendering
+
+    // Hardware decoding support
+    struct ra_hwdec_ctx hwdec_ctx;           // Driver registry
+    struct ra_ctx *ra_ctx;                   // Synthetic ra_ctx for hwdec infrastructure
 };
 
 /*
@@ -86,16 +96,56 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
         return err;
     }
 
+    // Set up hardware decoding infrastructure.
+    // Create a synthetic ra_ctx wrapping the old RA for the hwdec system.
+    if (p->context->old_ra) {
+        p->ra_ctx = talloc_zero(p, struct ra_ctx);
+        *p->ra_ctx = (struct ra_ctx) {
+            .ra = p->context->old_ra,
+            .global = ctx->global,
+            .log = mp_log_new(p, ctx->log, "hwdec"),
+        };
+
+        // Pass native display resources to the old RA so hwdec drivers
+        // (e.g. VA-API) can create their display handles.
+        for (int n = 0; params && params[n].type; n++) {
+            void *data = params[n].data;
+            const char *name = NULL;
+            switch (params[n].type) {
+            case MPV_RENDER_PARAM_WL_DISPLAY:  name = "wl";  break;
+            case MPV_RENDER_PARAM_X11_DISPLAY: name = "x11"; break;
+            default: break;
+            }
+            if (name && data)
+                ra_add_native_resource(p->context->old_ra, name, data);
+        }
+
+        p->hwdec_ctx = (struct ra_hwdec_ctx) {
+            .log = p->ra_ctx->log,
+            .global = ctx->global,
+            .ra_ctx = p->ra_ctx,
+        };
+    }
+
+    ctx->hwdec_devs = hwdec_devices_create();
+
+    // Load all hwdec drivers eagerly. The embedded path has no VO control
+    // channel for lazy loading, so we load everything at init time.
+    if (p->ra_ctx)
+        ra_hwdec_ctx_init(&p->hwdec_ctx, ctx->hwdec_devs, "auto", true);
+
     // Initialize our synchronous libplacebo rendering engine.
-    p->video_engine = pl_video_init(ctx->global, ctx->log, p->context->ra);
+    p->video_engine = pl_video_init(ctx->global, ctx->log, p->context->ra,
+                                    p->ra_ctx ? &p->hwdec_ctx : NULL,
+                                    p->context->gpu);
     if (!p->video_engine) {
+        ra_hwdec_ctx_uninit(&p->hwdec_ctx);
+        hwdec_devices_destroy(ctx->hwdec_devs);
         p->context->fns->destroy(p->context);
         talloc_free(p->context);
         return MPV_ERROR_VO_INIT_FAILED;
     }
 
-    // Create hardware decoder devices.
-    ctx->hwdec_devs = hwdec_devices_create();
     ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_VFLIP;
     return 0;
 }
@@ -109,10 +159,11 @@ static void destroy(struct render_backend *ctx)
     struct priv *p = ctx->priv;
     if (!p) return;
 
-    hwdec_devices_destroy(ctx->hwdec_devs);
     pl_video_uninit(&p->video_engine);
+    ra_hwdec_ctx_uninit(&p->hwdec_ctx);
+    hwdec_devices_destroy(ctx->hwdec_devs);
     if (p->context) {
-        p->context->fns->destroy(p->context); // This destroys the RA
+        p->context->fns->destroy(p->context); // This destroys both RAs
         talloc_free(p->context);
     }
     talloc_free(p);
@@ -174,11 +225,14 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
     // Render the video frame.
     pl_video_render(p->video_engine, frame, target_tex);
 
-    // Destroy the temporary wrapper texture via the RA.
-    ra_next_tex_destroy(p->context->ra, &target_tex);
-
+    // Complete the frame (e.g. Vulkan hold/release ownership cycle).
+    // Must happen before destroying the wrapper so the backend can
+    // transfer ownership and transition the image layout.
     if (p->context->fns->done_frame)
         p->context->fns->done_frame(p->context);
+
+    // Destroy the temporary wrapper texture via the RA.
+    ra_next_tex_destroy(p->context->ra, &target_tex);
 
     return 0;
 }
@@ -242,7 +296,18 @@ static void reset(struct render_backend *ctx)
 static bool check_format(struct render_backend *ctx, int imgfmt)
 {
     struct priv *p = ctx->priv;
-    return p->video_engine ? pl_video_check_format(p->video_engine, imgfmt) : false;
+    if (!p->video_engine)
+        return false;
+
+    // Check software format support
+    if (pl_video_check_format(p->video_engine, imgfmt))
+        return true;
+
+    // Check hwdec format support (e.g. IMGFMT_VAAPI, IMGFMT_VULKAN)
+    if (p->ra_ctx && ra_hwdec_get(&p->hwdec_ctx, imgfmt))
+        return true;
+
+    return false;
 }
 
 /*
@@ -273,13 +338,25 @@ static int get_target_size(struct render_backend *ctx, mpv_render_param *params,
         return 0;
     }
 
-    // FBO path
+    // FBO path: try to read dimensions from backend-specific params first
+    // to avoid heavyweight Vulkan wrap/release operations for a size query.
+    mpv_vulkan_fbo *vk_fbo =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_FBO, NULL);
+    if (vk_fbo && vk_fbo->width && vk_fbo->height) {
+        *out_w = vk_fbo->width;
+        *out_h = vk_fbo->height;
+        return 0;
+    }
+
+    // OpenGL / fallback path: wrap to query dimensions.
     pl_tex tex = NULL;
     int err = p->context->fns->wrap_fbo(p->context, params, &tex);
     if (err < 0) return err;
     if (!tex) return MPV_ERROR_GENERIC;
     *out_w = tex->params.w;
     *out_h = tex->params.h;
+    if (p->context->fns->done_frame)
+        p->context->fns->done_frame(p->context);
     ra_next_tex_destroy(p->context->ra, &tex);
     return 0;
 }

@@ -25,6 +25,10 @@ struct libmpv_gpu_next_context {
     // Optional: swapchain created from MPV_RENDER_PARAM_VULKAN_SURFACE.
     // When non-NULL, rendering uses the swapchain instead of FBO wrapping.
     pl_swapchain swapchain;
+
+    // Old-style RA wrapping the same pl_gpu, needed by the hwdec infrastructure.
+    // Created via ra_create_pl() alongside the new RA.
+    struct ra *old_ra;
 };
 
 /**

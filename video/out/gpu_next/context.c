@@ -26,6 +26,8 @@
 #include <libplacebo/opengl.h>                   // for pl_opengl_destroy
 #include "video/out/gpu_next/libmpv_gpu_next.h"  // for libmpv_gpu_next_context
 #include "video/out/gpu_next/ra.h"               // for ra_pl_create, ra_pl_...
+#include "video/out/placebo/ra_pl.h"             // for ra_create_pl (old RA)
+#include "video/out/gpu/ra.h"                    // for ra_free
 #endif
 
 #ifdef PL_HAVE_VULKAN
@@ -33,6 +35,9 @@
 #include <libplacebo/vulkan.h>                   // for pl_vulkan_import
 #include "video/out/gpu_next/libmpv_gpu_next.h"  // for libmpv_gpu_next_context
 #include "video/out/gpu_next/ra.h"               // for ra_pl_create, ra_pl_...
+#include "video/out/placebo/ra_pl.h"             // for ra_create_pl (old RA)
+#include "video/out/gpu/ra.h"                    // for ra_free, ra_add_native_resource
+#include "video/out/vulkan/common.h"             // for struct mpvk_ctx
 #endif
 
 #include <stddef.h>                              // for NULL
@@ -359,6 +364,16 @@ static int libmpv_gpu_next_init_gl(struct libmpv_gpu_next_context *ctx, mpv_rend
         return MPV_ERROR_VO_INIT_FAILED;
     }
 
+    // Create old-style RA for hwdec infrastructure (wraps same pl_gpu)
+    ctx->old_ra = ra_create_pl(p->gpu, mp_log_new(ctx, ctx->log, "old-ra"));
+    if (!ctx->old_ra) {
+        MP_ERR(ctx, "Failed to create old RA for hwdec\n");
+        ra_pl_destroy(&p->ra);
+        pl_opengl_destroy(&p->gl);
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_VO_INIT_FAILED;
+    }
+
     ctx->ra = p->ra;
     ctx->gpu = p->gpu;
     return 0;
@@ -419,6 +434,11 @@ static void libmpv_gpu_next_destroy_gl(struct libmpv_gpu_next_context *ctx)
     if (!p)
         return;
 
+    // Don't use ra_free() here — destroy_ra_pl() already calls talloc_free(ra),
+    // so ra_free() would double-free.
+    talloc_free(ctx->old_ra);
+    ctx->old_ra = NULL;
+
     if (p->ra) {
         ra_pl_destroy(&p->ra);
     }
@@ -447,6 +467,20 @@ struct priv_vk {
     pl_gpu gpu;
     struct ra_next *ra;
     pl_swapchain swapchain;  // Created when MPV_RENDER_PARAM_VULKAN_SURFACE is provided
+
+    // Vulkan context wrapper exposed to hwdec drivers via ra_vk_ctx_get().
+    // Populated after pl_vulkan_import() so hwdec can do zero-copy decode.
+    struct mpvk_ctx mpvk;
+
+    // Internal semaphore used for the hold/release cycle when the embedder
+    // does not provide one. Created once at init, reused every frame.
+    VkSemaphore internal_sem;
+
+    // Per-frame state for the FBO path. Populated by wrap_fbo, consumed by
+    // done_frame to complete the hold/release ownership cycle.
+    pl_tex current_tex;              // wrapped texture for this frame
+    VkImageLayout target_layout;     // layout to transition to after render
+    mpv_vulkan_sync current_sync;    // semaphores for this frame (zeroed = none)
 };
 
 /**
@@ -510,6 +544,9 @@ static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_rend
         .features = vk_params->features,
         .extensions = vk_params->extensions,
         .num_extensions = vk_params->num_extensions,
+        .lock_queue = vk_params->lock_queue,
+        .unlock_queue = vk_params->unlock_queue,
+        .queue_ctx = vk_params->queue_ctx,
     };
 
     p->vulkan = pl_vulkan_import(p->pl_log, &import_params);
@@ -577,16 +614,60 @@ static int libmpv_gpu_next_init_vk(struct libmpv_gpu_next_context *ctx, mpv_rend
         }
     }
 
-    // Create the RA abstraction
-    p->ra = ra_pl_create(p->gpu, ctx->log, p->pl_log);
-    if (!p->ra) {
-        MP_ERR(ctx, "Failed to create RA from pl_gpu\n");
+    // Create an internal binary semaphore for the hold/release fallback path
+    // (when the embedder does not provide semaphores).
+    p->internal_sem = pl_vulkan_sem_create(p->gpu, pl_vulkan_sem_params(
+        .type = VK_SEMAPHORE_TYPE_BINARY,
+    ));
+    if (!p->internal_sem) {
+        MP_ERR(ctx, "Failed to create internal semaphore\n");
         if (p->swapchain)
             pl_swapchain_destroy(&p->swapchain);
         pl_vulkan_destroy(&p->vulkan);
         pl_log_destroy(&p->pl_log);
         return MPV_ERROR_VO_INIT_FAILED;
     }
+
+    // Create the RA abstraction
+    p->ra = ra_pl_create(p->gpu, ctx->log, p->pl_log);
+    if (!p->ra) {
+        MP_ERR(ctx, "Failed to create RA from pl_gpu\n");
+        pl_vulkan_sem_destroy(p->gpu, &p->internal_sem);
+        if (p->swapchain)
+            pl_swapchain_destroy(&p->swapchain);
+        pl_vulkan_destroy(&p->vulkan);
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_VO_INIT_FAILED;
+    }
+
+    // Create old-style RA for hwdec infrastructure (wraps same pl_gpu)
+    ctx->old_ra = ra_create_pl(p->gpu, mp_log_new(ctx, ctx->log, "old-ra"));
+    if (!ctx->old_ra) {
+        MP_ERR(ctx, "Failed to create old RA for hwdec\n");
+        ra_pl_destroy(&p->ra);
+        pl_vulkan_sem_destroy(p->gpu, &p->internal_sem);
+        if (p->swapchain)
+            pl_swapchain_destroy(&p->swapchain);
+        pl_vulkan_destroy(&p->vulkan);
+        pl_log_destroy(&p->pl_log);
+        return MPV_ERROR_VO_INIT_FAILED;
+    }
+
+    // Expose Vulkan context to hwdec drivers.  ra_vk_ctx_get() checks for
+    // a native resource named "mpvk_ctx" when the standard swapchain path
+    // is unavailable (libmpv FBO render mode has no swapchain).
+    p->mpvk = (struct mpvk_ctx) {
+        .pllog  = p->pl_log,
+        .vulkan = p->vulkan,
+        .gpu    = p->gpu,
+        // vkinst is NULL — pl_vulkan already exposes instance, get_proc_addr
+        // Full device extension list from the embedder (pl_vulkan filters
+        // these to only what libplacebo uses, but hwdec needs the full set
+        // for FFmpeg's AVVulkanDeviceContext).
+        .dev_extensions     = vk_params->extensions,
+        .num_dev_extensions = vk_params->num_extensions,
+    };
+    ra_add_native_resource(ctx->old_ra, "mpvk_ctx", &p->mpvk);
 
     ctx->ra = p->ra;
     ctx->gpu = p->gpu;
@@ -607,6 +688,14 @@ static int libmpv_gpu_next_wrap_fbo_vk(struct libmpv_gpu_next_context *ctx,
     struct priv_vk *p = ctx->priv;
     *out_tex = NULL;
 
+    // Guard: if wrap_fbo is called again before done_frame completed the
+    // previous hold/release cycle, the previous image's ownership is leaked.
+    if (p->current_tex)
+        MP_WARN(ctx, "wrap_fbo called before done_frame — previous frame not held\n");
+
+    p->current_tex = NULL;
+    p->current_sync = (mpv_vulkan_sync){0};
+
     mpv_vulkan_fbo *fbo =
         get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_FBO, NULL);
     if (!fbo)
@@ -617,14 +706,25 @@ static int libmpv_gpu_next_wrap_fbo_vk(struct libmpv_gpu_next_context *ctx,
         return MPV_ERROR_INVALID_PARAMETER;
     }
 
-    // Wrap the VkImage as pl_tex using pl_vulkan_wrap
+    // Read sync parameters (optional — if absent, done_frame falls back to
+    // pl_gpu_finish which is correct but causes a full GPU stall).
+    mpv_vulkan_sync *sync =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_SYNC, NULL);
+
+    VkImageUsageFlags usage = fbo->usage;
+    if (!usage)
+        usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    // Wrap the embedder's VkImage. The wrapper is a lightweight CPU-side
+    // descriptor — no pixel copies. The host destroys it via
+    // ra_next_tex_destroy after done_frame completes the hold cycle, so
+    // no previous wrapper for this image exists at this point.
     struct pl_vulkan_wrap_params wrap_params = {
         .image = fbo->image,
         .width = fbo->width,
         .height = fbo->height,
         .format = fbo->format,
-        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .usage = usage,
     };
 
     pl_tex tex = pl_vulkan_wrap(p->gpu, &wrap_params);
@@ -633,14 +733,27 @@ static int libmpv_gpu_next_wrap_fbo_vk(struct libmpv_gpu_next_context *ctx,
         return MPV_ERROR_GENERIC;
     }
 
-    // Release the texture to libplacebo - it starts out "held" by user
-    // We need to tell libplacebo it can now use the texture
+    // Release the texture to libplacebo — it starts out "held" by the user
+    // after pl_vulkan_wrap(). If the embedder provided a wait semaphore,
+    // libplacebo will wait on it before touching the image.
     struct pl_vulkan_release_params release_params = {
         .tex = tex,
         .layout = fbo->current_layout,
         .qf = VK_QUEUE_FAMILY_IGNORED,
     };
+    if (sync && sync->wait_semaphore) {
+        release_params.semaphore = (pl_vulkan_sem) {
+            .sem = sync->wait_semaphore,
+            .value = sync->wait_value,
+        };
+    }
     pl_vulkan_release_ex(p->gpu, &release_params);
+
+    // Stash per-frame state for done_frame to complete the ownership cycle.
+    p->current_tex = tex;
+    p->target_layout = fbo->target_layout;
+    if (sync)
+        p->current_sync = *sync;
 
     *out_tex = tex;
     return 0;
@@ -648,14 +761,77 @@ static int libmpv_gpu_next_wrap_fbo_vk(struct libmpv_gpu_next_context *ctx,
 
 /**
  * @brief Callback to mark the end of a frame rendering (Vulkan).
- * @param ctx The libmpv_gpu_next_context.
+ *
+ * Transfers texture ownership back to the embedder via pl_vulkan_hold_ex.
+ * If the embedder provided a signal semaphore via MPV_RENDER_PARAM_VULKAN_SYNC,
+ * that semaphore is signaled when the image is ready. Otherwise an internal
+ * semaphore is used and we stall with pl_gpu_finish() so the image is safe
+ * for the embedder to use immediately after this call returns.
  */
 static void libmpv_gpu_next_done_frame_vk(struct libmpv_gpu_next_context *ctx)
 {
     struct priv_vk *p = ctx->priv;
 
-    // Ensure GPU work is complete
-    pl_gpu_finish(p->gpu);
+    if (!p->current_tex) {
+        // Swapchain path or error — nothing to hold.
+        return;
+    }
+
+    VkSemaphore sem;
+    uint64_t sem_value;
+    bool user_provided_sem;
+
+    if (p->current_sync.signal_semaphore) {
+        sem = p->current_sync.signal_semaphore;
+        sem_value = p->current_sync.signal_value;
+        user_provided_sem = true;
+    } else if (p->internal_sem) {
+        sem = p->internal_sem;
+        sem_value = 0;
+        user_provided_sem = false;
+    } else {
+        // Internal semaphore lost (recreation failed on prior frame).
+        // Stall to ensure safety.
+        pl_gpu_finish(p->gpu);
+        p->current_tex = NULL;
+        return;
+    }
+
+    // Always hold — this transfers ownership back to the embedder and
+    // transitions the image to the requested layout.
+    bool ok = pl_vulkan_hold_ex(p->gpu, pl_vulkan_hold_params(
+        .tex = p->current_tex,
+        .layout = p->target_layout,
+        .qf = VK_QUEUE_FAMILY_IGNORED,
+        .semaphore = (pl_vulkan_sem) {
+            .sem = sem,
+            .value = sem_value,
+        },
+    ));
+    if (!ok) {
+        // Hold failed — the signal semaphore was never signaled. Stall the
+        // GPU so the embedder at least gets a quiescent image rather than
+        // deadlocking on a semaphore that will never fire.
+        MP_ERR(ctx, "pl_vulkan_hold_ex failed, falling back to gpu_finish\n");
+        pl_gpu_finish(p->gpu);
+
+        // The internal binary semaphore is now in an unknown state — it was
+        // never signaled, so the next frame's hold would deadlock. Recreate it.
+        if (!user_provided_sem) {
+            pl_vulkan_sem_destroy(p->gpu, &p->internal_sem);
+            p->internal_sem = pl_vulkan_sem_create(p->gpu, pl_vulkan_sem_params(
+                .type = VK_SEMAPHORE_TYPE_BINARY,
+            ));
+            if (!p->internal_sem)
+                MP_ERR(ctx, "Failed to recreate internal semaphore\n");
+        }
+    } else if (!user_provided_sem) {
+        // No user semaphore — stall to ensure the image is safe for the
+        // embedder immediately after this call returns.
+        pl_gpu_finish(p->gpu);
+    }
+
+    p->current_tex = NULL;
 }
 
 /**
@@ -668,8 +844,22 @@ static void libmpv_gpu_next_destroy_vk(struct libmpv_gpu_next_context *ctx)
     if (!p)
         return;
 
+    // Handle mid-frame teardown: if a texture is still in flight, complete
+    // the ownership cycle before tearing down resources.
+    if (p->current_tex)
+        libmpv_gpu_next_done_frame_vk(ctx);
+
+    // Don't use ra_free() here — destroy_ra_pl() already calls talloc_free(ra),
+    // so ra_free() would double-free.
+    talloc_free(ctx->old_ra);
+    ctx->old_ra = NULL;
+
     if (p->ra) {
         ra_pl_destroy(&p->ra);
+    }
+
+    if (p->internal_sem) {
+        pl_vulkan_sem_destroy(p->gpu, &p->internal_sem);
     }
 
     if (p->swapchain) {

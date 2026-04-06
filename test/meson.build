@@ -143,6 +143,12 @@ if get_option('libmpv')
                      include_directories: incdir, dependencies: libmpv_dep)
     test('libmpv-encode', exe, suite: 'libmpv')
 
+    if features['vulkan']
+        exe = executable('libmpv-test-vulkan-render', 'libmpv_test_vulkan_render.c',
+                         include_directories: incdir, dependencies: [libmpv_dep, vulkan])
+        test('libmpv-test-vulkan-render', exe, suite: 'libmpv')
+    endif
+
     mpvlib = libmpv
     shared = get_option('default_library') == 'shared'
     if get_option('default_library') == 'both'

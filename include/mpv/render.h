@@ -50,6 +50,7 @@ extern "C" {
  * ------------------
  *
  * OpenGL: via MPV_RENDER_API_TYPE_OPENGL, see render_gl.h header.
+ * Vulkan: via MPV_RENDER_API_TYPE_VULKAN, see render_vk.h header.
  * Software: via MPV_RENDER_API_TYPE_SW, see section "Software renderer"
  *
  * Threading

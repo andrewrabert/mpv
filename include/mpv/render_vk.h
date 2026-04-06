@@ -132,22 +132,36 @@ typedef struct mpv_vulkan_init_params {
      * Number of extensions in the extensions array.
      */
     int num_extensions;
+
+    /**
+     * Optional: Functions for locking/unlocking a Vulkan queue before/after
+     * command submission. Required when the embedder and mpv share a VkDevice
+     * and may submit to the same queue from different threads.
+     *
+     * qf: queue family index, qidx: queue index within the family.
+     * ctx: the value of queue_ctx below.
+     *
+     * If NULL, libplacebo uses its own internal locking (safe only if the
+     * embedder never submits to the same queue concurrently).
+     */
+    void (*lock_queue)(void *ctx, uint32_t qf, uint32_t qidx);
+    void (*unlock_queue)(void *ctx, uint32_t qf, uint32_t qidx);
+    void *queue_ctx;
 } mpv_vulkan_init_params;
 
 /**
  * For MPV_RENDER_PARAM_VULKAN_FBO - describes the render target.
+ *
+ * Note: image_view was removed. libplacebo creates image views internally
+ * from the provided VkImage. Embedders no longer need to manage views.
  */
 typedef struct mpv_vulkan_fbo {
     /**
      * The VkImage to render into. Must be created with VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-     * and VK_IMAGE_USAGE_TRANSFER_DST_BIT.
+     * and VK_IMAGE_USAGE_TRANSFER_DST_BIT at minimum. Additional usage flags
+     * may be specified via the usage field below.
      */
     VkImage image;
-
-    /**
-     * Image view for the target image. Must be a 2D view of the image.
-     */
-    VkImageView image_view;
 
     /**
      * Image dimensions in pixels.
@@ -160,6 +174,13 @@ typedef struct mpv_vulkan_fbo {
      * or VK_FORMAT_R8G8B8A8_UNORM.
      */
     VkFormat format;
+
+    /**
+     * Usage flags the image was created with. libplacebo uses this to
+     * determine which operations are available on the texture. If 0,
+     * defaults to VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | TRANSFER_DST_BIT.
+     */
+    VkImageUsageFlags usage;
 
     /**
      * Current layout of the image when passed to mpv. mpv will transition

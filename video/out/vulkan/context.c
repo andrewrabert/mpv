@@ -142,11 +142,20 @@ static const struct ra_swapchain_fns vulkan_swapchain;
 
 struct mpvk_ctx *ra_vk_ctx_get(struct ra_ctx *ctx)
 {
-    if (!ctx->swapchain || ctx->swapchain->fns != &vulkan_swapchain)
+    if (!ctx)
         return NULL;
 
-    struct priv *p = ctx->swapchain->priv;
-    return p->vk;
+    // Standard VO path: swapchain-based lookup
+    if (ctx->swapchain && ctx->swapchain->fns == &vulkan_swapchain) {
+        struct priv *p = ctx->swapchain->priv;
+        return p->vk;
+    }
+
+    // libmpv render API path: native resource registered by gpu-next init
+    if (ctx->ra)
+        return ra_get_native_resource(ctx->ra, "mpvk_ctx");
+
+    return NULL;
 }
 
 void ra_vk_ctx_uninit(struct ra_ctx *ctx)

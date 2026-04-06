@@ -20,7 +20,9 @@
 #include "video/img_format.h"              // for mp_imgfmt
 #include "video/mp_image.h"                // for mp_image, mp_image_params
 #include "video/out/gpu_next/ra.h"         // for ra_next_find_fmt, ra_next_...
+#include "video/out/gpu/hwdec.h"           // for ra_hwdec_ctx, ra_hwdec, ra_hwdec_mapper
 #include "video/out/gpu/video.h"           // for gl_video_opts, gl_video_conf
+#include "video/out/placebo/ra_pl.h"       // for ra_pl_get (hwdec tex extraction)
 #include "video/out/vo.h"                  // for vo_frame
 
 // Forward declarations
@@ -90,6 +92,11 @@ struct pl_video {
 
     // Flip state (for OpenGL FBO orientation)
     bool flipped;
+
+    // Hardware decoding state
+    struct ra_hwdec_ctx *hwdec_ctx;       // Driver registry (owned by libmpv_gpu_next.c)
+    struct ra_hwdec_mapper *hwdec_mapper; // Current mapper (owned, created on demand)
+    pl_gpu gpu;                           // Direct handle for hwdec tex extraction
 };
 
 /**
@@ -97,8 +104,105 @@ struct pl_video {
  * This allows the static callback functions to access the main pl_video state.
  */
 struct frame_priv {
-    struct pl_video *p; // A pointer back to the main pl_video engine struct.
+    struct pl_video *p;             // A pointer back to the main pl_video engine struct.
+    struct ra_hwdec *hwdec;         // Non-NULL if this frame uses hardware decoding.
 };
+
+/**
+ * @brief Reconfigure the hwdec mapper for changed image parameters.
+ *
+ * Creates a new mapper if needed, or updates dynamic metadata (HDR, Dolby
+ * Vision) on the existing one if the static parameters haven't changed.
+ */
+static bool hwdec_reconfig(struct pl_video *p, struct ra_hwdec *hwdec,
+                           const struct mp_image_params *par)
+{
+    if (p->hwdec_mapper) {
+        if (mp_image_params_static_equal(par, &p->hwdec_mapper->src_params)) {
+            p->hwdec_mapper->src_params.repr.dovi = par->repr.dovi;
+            p->hwdec_mapper->dst_params.repr.dovi = par->repr.dovi;
+            p->hwdec_mapper->src_params.color.hdr = par->color.hdr;
+            p->hwdec_mapper->dst_params.color.hdr = par->color.hdr;
+            return true;
+        }
+        ra_hwdec_mapper_free(&p->hwdec_mapper);
+    }
+
+    p->hwdec_mapper = ra_hwdec_mapper_create(hwdec, par);
+    if (!p->hwdec_mapper) {
+        mp_msg(p->log, MSGL_ERR, "Initializing texture for hardware decoding failed.\n");
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Extract a pl_tex from a hwdec mapper's ra_tex.
+ *
+ * For pl-based RAs (which is always the case in the embedded path since
+ * both old and new RA wrap the same pl_gpu), ra_tex->priv IS the pl_tex.
+ */
+static pl_tex hwdec_get_tex(struct pl_video *p, int n)
+{
+    struct ra_tex *ratex = p->hwdec_mapper->tex[n];
+    if (!ratex)
+        return NULL;
+    if (ra_pl_get(p->hwdec_mapper->ra))
+        return (pl_tex) ratex->priv;
+
+    mp_msg(p->log, MSGL_ERR, "Failed mapping hwdec frame (unsupported RA backend)\n");
+    return NULL;
+}
+
+/**
+ * @brief Acquire callback for hwdec frames.
+ *
+ * Called by libplacebo just before rendering. Maps the hardware surface
+ * (e.g. VA-API → DMA-buf → pl_tex) and populates the frame's plane textures.
+ */
+static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
+{
+    struct mp_image *mpi = frame->user_data;
+    struct frame_priv *fp = mpi->priv;
+    struct pl_video *p = fp->p;
+
+    if (!hwdec_reconfig(p, fp->hwdec, &mpi->params))
+        return false;
+
+    if (ra_hwdec_mapper_map(p->hwdec_mapper, mpi) < 0) {
+        mp_msg(p->log, MSGL_ERR, "Mapping hardware decoded surface failed.\n");
+        return false;
+    }
+
+    for (int n = 0; n < frame->num_planes; n++) {
+        if (!(frame->planes[n].texture = hwdec_get_tex(p, n))) {
+            ra_hwdec_mapper_unmap(p->hwdec_mapper);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * @brief Release callback for hwdec frames.
+ *
+ * Called by libplacebo after rendering. Unmaps the hardware surface,
+ * releasing DMA-buf file descriptors and temporary textures.
+ */
+static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
+{
+    struct mp_image *mpi = frame->user_data;
+    struct frame_priv *fp = mpi->priv;
+    struct pl_video *p = fp->p;
+
+    // For non-pl RA, textures were wrapped — destroy them to avoid leaks.
+    if (!ra_pl_get(p->hwdec_mapper->ra)) {
+        for (int n = 0; n < frame->num_planes; n++)
+            pl_tex_destroy(gpu, &frame->planes[n].texture);
+    }
+    ra_hwdec_mapper_unmap(p->hwdec_mapper);
+}
 
 /**
  * @brief Callback to map an mp_image to a pl_frame for rendering.
@@ -118,19 +222,69 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
 
-    // Use the RA helper to upload the mp_image data to a new set of textures
-    // and populate the pl_frame struct with the result.
-    if (!ra_upload_mp_image(p->ra, frame, mpi)) {
-        talloc_free(mpi); // Clean up the mp_image reference on failure
-        return false;
+    // Check if this is a hardware decoded frame
+    fp->hwdec = p->hwdec_ctx ? ra_hwdec_get(p->hwdec_ctx, mpi->imgfmt) : NULL;
+
+    if (fp->hwdec) {
+        // Hardware decoded frame: set up deferred mapping via acquire/release.
+        // The actual DMA-buf import happens in hwdec_acquire when libplacebo
+        // is ready to render.
+        struct mp_image_params par = mpi->params;
+        if (!hwdec_reconfig(p, fp->hwdec, &mpi->params)) {
+            talloc_free(mpi);
+            return false;
+        }
+        par = p->hwdec_mapper->dst_params;
+        mp_image_params_guess_csp(&par);
+
+        struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(par.imgfmt);
+        *frame = (struct pl_frame) {
+            .color = par.color,
+            .repr = par.repr,
+            .profile = {
+                .data = mpi->icc_profile ? mpi->icc_profile->data : NULL,
+                .len = mpi->icc_profile ? mpi->icc_profile->size : 0,
+            },
+            .rotation = par.rotate / 90,
+            .user_data = mpi,
+            .acquire = hwdec_acquire,
+            .release = hwdec_release,
+            .num_planes = desc.num_planes,
+        };
+
+        // Apply HDR and colorspace overrides from options
+        const struct gl_video_opts *opts = p->opts_cache->opts;
+        if (opts->hdr_reference_white && !pl_color_transfer_is_hdr(frame->color.transfer))
+            frame->color.hdr.max_luma = opts->hdr_reference_white;
+        if (opts->treat_srgb_as_power22 & 1 && frame->color.transfer == PL_COLOR_TRC_SRGB)
+            frame->color.transfer = PL_COLOR_TRC_GAMMA22;
+
+        // Build plane component mappings from the format descriptor
+        for (int n = 0; n < frame->num_planes; n++) {
+            struct pl_plane *plane = &frame->planes[n];
+            int *map = plane->component_mapping;
+            for (int c = 0; c < mp_imgfmt_desc_get_num_comps(&desc); c++) {
+                if (desc.comps[c].plane != n)
+                    continue;
+                uint8_t offset = desc.comps[c].offset;
+                int index = plane->components++;
+                while (index > 0 && desc.comps[map[index - 1]].offset > offset) {
+                    map[index] = map[index - 1];
+                    index--;
+                }
+                map[index] = c;
+            }
+        }
+    } else {
+        // Software decoded frame: upload CPU data to GPU textures.
+        if (!ra_upload_mp_image(p->ra, frame, mpi)) {
+            talloc_free(mpi);
+            return false;
+        }
+        frame->rotation = mpi->params.rotate / 90;
+        frame->user_data = mpi;
     }
 
-    // Set rotation so libplacebo can undo mpv's pre-rotated crop rects.
-    frame->rotation = mpi->params.rotate / 90;
-
-    // Store a pointer back to the original mp_image. This is used to get a unique
-    // signature for the frame and to access metadata (like colorspace) later.
-    frame->user_data = mpi;
     return true;
 }
 
@@ -150,9 +304,12 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
     struct frame_priv *fp = mpi->priv;
     struct pl_video *p = fp->p;
 
-    // Use the RA helper to destroy the GPU textures associated with the frame.
-    ra_cleanup_pl_frame(p->ra, frame);
-    // Free the mp_image reference itself.
+    if (!fp->hwdec) {
+        // Software path: destroy the upload textures.
+        ra_cleanup_pl_frame(p->ra, frame);
+    }
+    // For hwdec: textures are managed by the mapper via acquire/release.
+
     talloc_free(mpi);
 }
 
@@ -177,10 +334,14 @@ static void discard_frame(const struct pl_source_frame *src)
  * @param ra The rendering abstraction context.
  * @return A pointer to the newly created pl_video engine, or NULL on failure.
  */
-struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, struct ra_next *ra) {
+struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log,
+                               struct ra_next *ra,
+                               struct ra_hwdec_ctx *hwdec_ctx, pl_gpu gpu) {
     struct pl_video *p = talloc_zero(NULL, struct pl_video);
     p->log = log;
     p->ra = ra;
+    p->hwdec_ctx = hwdec_ctx;
+    p->gpu = gpu;
     p->queue = ra_next_queue_create(ra);
 
     // Get video options for target colorspace settings
@@ -205,6 +366,7 @@ void pl_video_uninit(struct pl_video **p_ptr) {
     if (!p) return;
 
     ra_next_queue_destroy(&p->queue);
+    ra_hwdec_mapper_free(&p->hwdec_mapper);
 
     // Clean up all allocated OSD GPU resources
     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state_storage.entries); i++) {

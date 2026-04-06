@@ -1,7 +1,9 @@
+#include <inttypes.h>                // for PRId64
 #include <math.h>                   // for INFINITY
 #include <stdatomic.h>              // for atomic_load, atomic_bool, atomic_...
 #include <stdbool.h>                // for true, bool, false
 #include <stdint.h>                 // for int64_t, intptr_t, uint64_t, uint...
+#include <stdio.h>                  // for fprintf
 #include <stdlib.h>                 // for NULL, abs
 #include <string.h>                 // for strcmp
 #include "aspect.h"                 // for mp_get_src_dst_rects

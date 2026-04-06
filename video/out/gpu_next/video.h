@@ -11,13 +11,19 @@ struct mp_osd_res;
 struct mp_rect;
 struct mpv_global;
 struct osd_state;
+struct ra_hwdec_ctx;
 struct ra_next;
 struct vo_frame;
 
 /**
  * Initializes the rendering engine.
+ *
+ * hwdec_ctx may be NULL to disable hardware decoding support.
+ * gpu is needed for extracting pl_tex from hwdec mapper textures.
  */
-struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log, struct ra_next *ra);
+struct pl_video *pl_video_init(struct mpv_global *global, struct mp_log *log,
+                               struct ra_next *ra,
+                               struct ra_hwdec_ctx *hwdec_ctx, pl_gpu gpu);
 
 /**
  * Shuts down and destroys the rendering engine.
