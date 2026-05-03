@@ -191,6 +191,26 @@ bool gpu_ctx_resize(struct gpu_ctx *ctx, int w, int h)
     return pl_swapchain_resize(ctx->swapchain, &w, &h);
 }
 
+bool gpu_ctx_recreate_swapchain(struct gpu_ctx *ctx,
+                                const struct pl_color_space *hint,
+                                bool use_hint)
+{
+#if HAVE_VULKAN
+    struct mpvk_ctx *vkctx = ra_vk_ctx_get(ctx->ra_ctx);
+    if (vkctx) {
+        if (!ra_vk_ctx_recreate_swapchain(ctx->ra_ctx, hint, use_hint))
+            return false;
+
+        vkctx = ra_vk_ctx_get(ctx->ra_ctx);
+        ctx->gpu = vkctx->gpu;
+        ctx->swapchain = vkctx->swapchain;
+        return true;
+    }
+#endif
+
+    return false;
+}
+
 void gpu_ctx_destroy(struct gpu_ctx **ctxp)
 {
     struct gpu_ctx *ctx = *ctxp;

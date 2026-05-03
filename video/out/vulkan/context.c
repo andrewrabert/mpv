@@ -142,10 +142,29 @@ struct priv {
     struct mpvk_ctx *vk;
     struct vulkan_opts *opts;
     struct ra_ctx_params params;
+    VkPresentModeKHR preferred_mode;
     struct ra_tex proxy_tex;
 };
 
 static const struct ra_swapchain_fns vulkan_swapchain;
+
+static bool create_swapchain(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->swapchain->priv;
+
+    struct pl_vulkan_swapchain_params pl_params = {
+        .surface = p->vk->surface,
+        .present_mode = p->preferred_mode,
+        .swapchain_depth = ctx->vo->opts->swapchain_depth,
+        .alpha_bits = ctx->opts.want_alpha ? 8 : 0,
+    };
+
+    if (p->opts->swap_mode >= 0) // user override
+        pl_params.present_mode = p->opts->swap_mode;
+
+    p->vk->swapchain = pl_vulkan_create_swapchain(p->vk->vulkan, &pl_params);
+    return !!p->vk->swapchain;
+}
 
 struct mpvk_ctx *ra_vk_ctx_get(struct ra_ctx *ctx)
 {
@@ -423,6 +442,7 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
     struct priv *p = sw->priv = talloc_zero(sw, struct priv);
     p->vk = vk;
     p->params = params;
+    p->preferred_mode = preferred_mode;
     p->opts = mp_get_config_group(p, ctx->global, &vulkan_conf);
 
     vk->vulkan = mppl_create_vulkan(p->opts, vk->vkinst, vk->pllog, vk->surface,
@@ -435,19 +455,7 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
     if (!ctx->ra)
         goto error;
 
-    // Create the swapchain
-    struct pl_vulkan_swapchain_params pl_params = {
-        .surface = vk->surface,
-        .present_mode = preferred_mode,
-        .swapchain_depth = ctx->vo->opts->swapchain_depth,
-        .alpha_bits = ctx->opts.want_alpha ? 8 : 0,
-    };
-
-    if (p->opts->swap_mode >= 0) // user override
-        pl_params.present_mode = p->opts->swap_mode;
-
-    vk->swapchain = pl_vulkan_create_swapchain(vk->vulkan, &pl_params);
-    if (!vk->swapchain)
+    if (!create_swapchain(ctx))
         goto error;
 
     return true;
@@ -464,6 +472,40 @@ bool ra_vk_ctx_resize(struct ra_ctx *ctx, int width, int height)
     bool ok = pl_swapchain_resize(p->vk->swapchain, &width, &height);
     ctx->vo->dwidth = width;
     ctx->vo->dheight = height;
+
+    return ok;
+}
+
+bool ra_vk_ctx_recreate_swapchain(struct ra_ctx *ctx,
+                                  const struct pl_color_space *hint,
+                                  bool use_hint)
+{
+    struct mpvk_ctx *vk = ra_vk_ctx_get(ctx);
+    if (!vk || !vk->vulkan)
+        return false;
+
+    struct priv *p = ctx->swapchain->priv;
+    int width = ctx->vo->dwidth;
+    int height = ctx->vo->dheight;
+
+    pl_gpu_finish(vk->gpu);
+    pl_swapchain_destroy(&vk->swapchain);
+
+    if (!create_swapchain(ctx))
+        return false;
+
+    if (use_hint)
+        pl_swapchain_colorspace_hint(vk->swapchain, hint);
+
+    bool ok = true;
+    if (p->params.resize_swapchain) {
+        ok = p->params.resize_swapchain(ctx);
+    } else if (width > 0 && height > 0) {
+        ok = ra_vk_ctx_resize(ctx, width, height);
+    }
+
+    if (ok && p->params.swapchain_recreated)
+        p->params.swapchain_recreated(ctx);
 
     return ok;
 }

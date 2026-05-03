@@ -8,6 +8,9 @@ void ra_vk_ctx_uninit(struct ra_ctx *ctx);
 bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
                     struct ra_ctx_params params,
                     VkPresentModeKHR preferred_mode);
+bool ra_vk_ctx_recreate_swapchain(struct ra_ctx *ctx,
+                                  const struct pl_color_space *hint,
+                                  bool use_hint);
 
 // Helper for initializing mpvk_ctx->vulkan
 pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
