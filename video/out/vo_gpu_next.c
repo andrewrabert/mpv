@@ -18,6 +18,7 @@
  */
 
 #include <sys/stat.h>
+#include <string.h>
 #include <time.h>
 
 #include <libplacebo/colorspace.h>
@@ -143,6 +144,7 @@ struct priv {
     bool flush_cache;
     bool frame_pending;
     bool paused;
+    bool need_macvk_swapchain_recreate;
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -171,6 +173,11 @@ struct priv {
 
 static void update_render_options(struct vo *vo);
 static void update_lut(struct priv *p, struct user_lut *lut);
+
+static bool is_macvk(struct priv *p)
+{
+    return p->ra_ctx && p->ra_ctx->fns && strcmp(p->ra_ctx->fns->name, "macvk") == 0;
+ }
 
 struct gl_next_opts {
     bool delayed_peak;
@@ -1173,6 +1180,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     target_csp.hdr.max_fall = 0;
 
     struct pl_color_space hint = {0};
+    const struct pl_color_space *swapchain_hint = NULL;
+    bool update_swapchain_hint = false;
     bool target_hint = p->next_opts->target_hint == 1 ||
                        (p->next_opts->target_hint == -1 &&
                         target_csp.transfer != PL_COLOR_TRC_UNKNOWN);
@@ -1279,11 +1288,30 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         // Update again after possible max_luma change
         if (p->icc_profile)
             hint = p->icc_profile->csp;
-        external_params = set_colorspace_hint(p, &hint);
+        swapchain_hint = &hint;
+        update_swapchain_hint = true;
     } else if (!target_hint) {
         if (!hint.hdr.min_luma)
             hint.hdr.min_luma = target_csp.hdr.min_luma;
-        external_params = set_colorspace_hint(p, NULL);
+        update_swapchain_hint = true;
+    }
+
+    // macOS/Metal does not always promote an existing surface to EDR when
+    // only the swapchain colorspace hint changes. Recreate macvk's swapchain
+    // on video reconfig so MoltenVK reapplies the CAMetalLayer HDR state.
+    if (p->need_macvk_swapchain_recreate && frame->current) {
+        if (!gpu_ctx_recreate_swapchain(p->context, swapchain_hint,
+                                        update_swapchain_hint)) {
+            MP_ERR(vo, "Failed recreating macvk swapchain!\n");
+            p->need_macvk_swapchain_recreate = false;
+            return VO_FALSE;
+        }
+        p->gpu = p->context->gpu;
+        p->sw = p->context->swapchain;
+        gpu = p->gpu;
+        p->need_macvk_swapchain_recreate = false;
+    } else if (update_swapchain_hint) {
+        external_params = set_colorspace_hint(p, (struct pl_color_space *)swapchain_hint);
     }
 
     struct pl_swapchain_frame swframe;
@@ -1570,6 +1598,9 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     struct priv *p = vo->priv;
     if (!p->ra_ctx->fns->reconfig(p->ra_ctx))
         return -1;
+
+    if (is_macvk(p) && params)
+        p->need_macvk_swapchain_recreate = true;
 
     resize(vo);
     mp_mutex_lock(&vo->params_mutex);

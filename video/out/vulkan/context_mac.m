@@ -61,6 +61,9 @@ static bool mac_vk_check_visible(struct ra_ctx *ctx)
     return [p->vo_mac isVisible];
 }
 
+static bool resize(struct ra_ctx *ctx);
+static void swapchain_recreated(struct ra_ctx *ctx);
+
 static bool mac_vk_init(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
@@ -90,6 +93,8 @@ static bool mac_vk_init(struct ra_ctx *ctx)
         .swap_buffers = mac_vk_swap_buffers,
         .get_vsync = mac_vk_get_vsync,
         .color_depth = mac_vk_color_depth,
+        .resize_swapchain = resize,
+        .swapchain_recreated = swapchain_recreated,
         .check_visible = mac_vk_check_visible,
     };
 
@@ -118,8 +123,13 @@ static bool resize(struct ra_ctx *ctx)
         return false;
     }
     CGSize size = p->vo_mac.window.framePixel.size;
-
     return ra_vk_ctx_resize(ctx, (int)size.width, (int)size.height);
+}
+
+static void swapchain_recreated(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    [p->vo_mac pulseSurfaceForEDRActivation];
 }
 
 static bool mac_vk_reconfig(struct ra_ctx *ctx)

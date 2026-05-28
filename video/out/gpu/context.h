@@ -83,6 +83,13 @@ struct ra_ctx_params {
     // See ra_swapchain_fns.get_vsync.
     void (*get_vsync)(struct ra_ctx *ctx, struct vo_vsync_info *info);
 
+    // Platform-specific swapchain resize, if the platform owns the drawable
+    // size independently from vo->dwidth/dheight.
+    bool (*resize_swapchain)(struct ra_ctx *ctx);
+
+    // Optional platform hook after an explicit swapchain recreation.
+    void (*swapchain_recreated)(struct ra_ctx *ctx);
+
     // Set to the platform-specific function to swap buffers, like
     // glXSwapBuffers, eglSwapBuffers etc. This will be called by
     // ra_gl_ctx_swap_buffers. Required unless you either never call that

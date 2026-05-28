@@ -16,6 +16,7 @@
  */
 
 import Cocoa
+import QuartzCore
 
 class MacCommon: Common {
     @objc var layer: MetalLayer?
@@ -24,6 +25,8 @@ class MacCommon: Common {
     var timer: PreciseTimer?
     var swapTime: UInt64 = 0
     let swapLock: NSCondition = NSCondition()
+    var edrSurfacePulsePending: Bool = false
+    var edrSurfaceNeedsActivationPulse: Bool = true
 
     @objc init(_ vo: UnsafeMutablePointer<vo>) {
         let log = LogHelper(mp_log_new(vo, vo.pointee.log, "mac"))
@@ -113,6 +116,66 @@ class MacCommon: Common {
         return window?.occlusionState.contains(.visible) ?? false ||
                option.vo.force_render ||
                needsInitialDraw
+    }
+
+    @objc func pulseSurfaceForEDRActivation() {
+        // After a swapchain HDR transition, WindowServer may keep treating the
+        // already-visible Metal surface as SDR until its owning view changes.
+        // Moving the view origin by one backing pixel and restoring it forces
+        // that re-evaluation without resizing the window or drawable.
+        let pulse = {
+            guard let layer = self.layer,
+                  let view = self.view,
+                  let window = self.window else {
+                return
+            }
+
+            if !layer.wantsExtendedDynamicRangeContent {
+                self.edrSurfaceNeedsActivationPulse = true
+                return
+            }
+
+            guard self.edrSurfaceNeedsActivationPulse,
+                  !self.edrSurfacePulsePending,
+                  !window.isMiniaturized else {
+                return
+            }
+
+            let originalFrame = view.frame
+            var pulseFrame = originalFrame
+            let delta = 1.0 / max(window.backingScaleFactor, 1.0)
+            pulseFrame.origin.x += delta
+
+            self.edrSurfaceNeedsActivationPulse = false
+            self.edrSurfacePulsePending = true
+            view.frame = pulseFrame
+            view.layoutSubtreeIfNeeded()
+            view.displayIfNeeded()
+            layer.setNeedsLayout()
+            layer.layoutIfNeeded()
+            CATransaction.flush()
+            self.log.verbose("Metal layer EDR surface pulse applied")
+
+            DispatchQueue.main.async { [weak self, weak view, weak layer] in
+                guard let self = self else { return }
+                defer { self.edrSurfacePulsePending = false }
+                guard let view = view, let layer = layer else { return }
+
+                view.frame = originalFrame
+                view.layoutSubtreeIfNeeded()
+                view.displayIfNeeded()
+                layer.setNeedsLayout()
+                layer.layoutIfNeeded()
+                CATransaction.flush()
+                self.log.verbose("Metal layer EDR surface pulse restored")
+            }
+        }
+
+        if Thread.isMainThread {
+            pulse()
+        } else {
+            DispatchQueue.main.sync(execute: pulse)
+        }
     }
 
     @objc func update(alpha: Bool) {
