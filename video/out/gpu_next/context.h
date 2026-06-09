@@ -37,4 +37,7 @@ struct gpu_ctx {
 
 struct gpu_ctx *gpu_ctx_create(struct vo *vo, struct ra_ctx_opts *ctx_opts);
 bool gpu_ctx_resize(struct gpu_ctx *ctx, int w, int h);
+bool gpu_ctx_recreate_swapchain(struct gpu_ctx *ctx,
+                                const struct pl_color_space *hint,
+                                bool use_hint);
 void gpu_ctx_destroy(struct gpu_ctx **ctxp);
