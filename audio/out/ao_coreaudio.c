@@ -186,6 +186,9 @@ static int init(struct ao *ao)
     if (!register_hotplug_cb(ao))
         goto coreaudio_error;
 
+    if (!register_hotplug_cb(ao))
+        goto coreaudio_error;
+
     reinit_latency(ao);
     ao->device_buffer = av_rescale(atomic_load(&p->hw_latency_ns), ao->samplerate, 1000000000) * 2;
 
