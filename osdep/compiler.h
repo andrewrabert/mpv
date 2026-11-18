@@ -3,6 +3,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define MP_EXPAND_ARGS(...) __VA_ARGS__
 
